@@ -1,0 +1,19 @@
+id = "io.github.tyz-works.task-graph"
+name = "Task Graph"
+version = "0.1.1"
+min_herdr_version = "0.8.0"
+description = "Live dependency DAG and parallel-ready task view for Herdr agents"
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "task-graph"
+title = "Task Graph"
+placement = "tab"
+command = ["python3", "task_graph.py"]
+
+[[actions]]
+id = "open-task-graph"
+title = "Open Task Graph"
+description = "Open or focus the live task dependency dashboard"
+contexts = ["workspace"]
+command = ["sh", "scripts/open.sh"]

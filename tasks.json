@@ -1,0 +1,33 @@
+{
+  "title": "Product delivery",
+  "tasks": [
+    {
+      "id": "A",
+      "title": "要件整理",
+      "depends_on": [],
+      "status": "done"
+    },
+    {
+      "id": "B",
+      "title": "API実装",
+      "depends_on": ["A"],
+      "pane_match": "codex-1"
+    },
+    {
+      "id": "C",
+      "title": "UI実装",
+      "depends_on": ["A"],
+      "pane_match": "codex-2"
+    },
+    {
+      "id": "D",
+      "title": "結合テスト",
+      "depends_on": ["B", "C"]
+    },
+    {
+      "id": "E",
+      "title": "ドキュメント",
+      "depends_on": ["A"]
+    }
+  ]
+}
