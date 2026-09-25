@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import shutil
 import socket
 import tempfile
@@ -7,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -198,6 +200,172 @@ class SubscriberTests(unittest.TestCase):
         self.assertTrue(wait_until(lambda: model.connection == "live"), model.error)
         self.assertEqual(model.error, "")
         self.assertEqual(server.methods(), ["session.snapshot"])
+
+
+def write_tasks(path, title, ids=("A",)):
+    """Write a tasks.json in place (same inode, like a plain editor save)."""
+    tasks = [{"id": task_id, "title": task_id, "depends_on": []} for task_id in ids]
+    Path(path).write_text(json.dumps({"title": title, "tasks": tasks}), encoding="utf-8")
+
+
+def replace_tasks(path, title, ids=("A",)):
+    """Atomically swap in a new file (new inode), like crewvia's os.replace."""
+    tmp = Path(str(path) + ".tmp")
+    write_tasks(tmp, title, ids)
+    os.replace(tmp, path)
+
+
+class FakeScreen:
+    """Feeds run_tui a script: callables run between ticks (getch -> -1), ints are keys."""
+
+    def __init__(self, steps):
+        self.steps = list(steps)
+
+    def getmaxyx(self):
+        return 36, 120
+
+    def keypad(self, flag):
+        pass
+
+    def timeout(self, ms):
+        pass
+
+    def getch(self):
+        if not self.steps:
+            return ord("q")
+        step = self.steps.pop(0)
+        if callable(step):
+            step()
+            return -1
+        return step
+
+
+def drive_tui(model, config_path, steps):
+    with mock.patch.object(task_graph.curses, "curs_set"), \
+            mock.patch.object(task_graph, "init_colors", return_value={}), \
+            mock.patch.object(task_graph, "paint"):
+        task_graph.run_tui(FakeScreen(steps), model, config_path)
+
+
+def frame(model):
+    return "\n".join(task_graph.render_dashboard(model, 120, 36).plain_lines())
+
+
+class AutoReloadTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="hg"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = self.tmp / "tasks.json"
+        write_tasks(self.path, "first")
+        self.model = task_graph.DashboardModel(task_graph.load_config(self.path))
+
+    def test_os_replace_is_picked_up_without_pressing_r(self):
+        seen = {}
+        drive_tui(self.model, self.path, [
+            -1,
+            lambda: replace_tasks(self.path, "second", ids=("A", "B")),
+            lambda: seen.update(frame=frame(self.model)),
+        ])
+        self.assertEqual(self.model.config["title"], "second")
+        self.assertEqual([task["id"] for task in self.model.config["tasks"]], ["A", "B"])
+        self.assertIn("second", seen["frame"])
+        self.assertNotIn("ERROR", seen["frame"])
+
+    def test_in_place_rewrite_is_picked_up(self):
+        drive_tui(self.model, self.path, [
+            lambda: write_tasks(self.path, "rewritten with a longer title", ids=("A", "B", "C")),
+            -1,
+        ])
+        self.assertEqual(self.model.config["title"], "rewritten with a longer title")
+
+    def test_replacing_target_behind_symlink_is_picked_up(self):
+        real_dir = self.tmp / "real"
+        real_dir.mkdir()
+        target = real_dir / "tasks.json"
+        write_tasks(target, "via link")
+        config_dir = self.tmp / "config"
+        config_dir.mkdir()
+        link = config_dir / "tasks.json"
+        link.symlink_to(target)
+        model = task_graph.DashboardModel(task_graph.load_config(link))
+        drive_tui(model, link, [
+            -1,
+            lambda: replace_tasks(target, "target swapped"),
+            -1,
+        ])
+        self.assertEqual(model.config["title"], "target swapped")
+
+    def test_repointing_the_symlink_is_picked_up(self):
+        first = self.tmp / "first.json"
+        second = self.tmp / "second.json"
+        write_tasks(first, "old target")
+        write_tasks(second, "new target")
+        link = self.tmp / "link.json"
+        link.symlink_to(first)
+        model = task_graph.DashboardModel(task_graph.load_config(link))
+
+        def repoint():
+            tmp_link = self.tmp / "link.tmp"
+            tmp_link.symlink_to(second)
+            os.replace(tmp_link, link)
+
+        drive_tui(model, link, [-1, repoint, -1])
+        self.assertEqual(model.config["title"], "new target")
+
+    def test_broken_json_keeps_previous_config_and_shows_error(self):
+        seen = {}
+        drive_tui(self.model, self.path, [
+            lambda: self.path.write_text('{"title": "half written", "tasks": [', encoding="utf-8"),
+            lambda: seen.update(frame=frame(self.model)),
+        ])
+        self.assertEqual(self.model.config["title"], "first")
+        self.assertEqual([task["id"] for task in self.model.config["tasks"]], ["A"])
+        self.assertIn("ERROR", seen["frame"])
+        self.assertIn("[READY] A", seen["frame"])
+
+    def test_config_error_survives_subscriber_clearing_its_own_error(self):
+        drive_tui(self.model, self.path, [
+            lambda: self.path.write_text("not json", encoding="utf-8"),
+            -1,
+        ])
+        with self.model.lock:  # what HerdrSubscriber does after each snapshot
+            self.model.error = ""
+        self.assertIn("ERROR", frame(self.model))
+
+    def test_recovers_when_file_is_fixed(self):
+        seen = {}
+        drive_tui(self.model, self.path, [
+            lambda: self.path.write_text("not json", encoding="utf-8"),
+            -1,
+            lambda: replace_tasks(self.path, "fixed"),
+            lambda: seen.update(frame=frame(self.model)),
+        ])
+        self.assertEqual(self.model.config["title"], "fixed")
+        self.assertNotIn("ERROR", seen["frame"])
+
+    def test_broken_file_is_parsed_once_not_every_tick(self):
+        self.path.write_text("not json", encoding="utf-8")
+        with mock.patch.object(task_graph, "load_config", wraps=task_graph.load_config) as loader:
+            drive_tui(self.model, self.path, [-1, -1, -1, -1])
+        self.assertEqual(loader.call_count, 1)
+
+    def test_r_key_still_reloads(self):
+        drive_tui(self.model, self.path, [
+            lambda: write_tasks(self.path, "manual"),
+            ord("r"),
+        ])
+        self.assertEqual(self.model.config["title"], "manual")
+
+    def test_selection_is_clamped_when_tasks_shrink(self):
+        write_tasks(self.path, "big", ids=("A", "B", "C"))
+        self.model.replace_config(task_graph.load_config(self.path))
+        drive_tui(self.model, self.path, [
+            ord("j"),
+            ord("j"),
+            lambda: replace_tasks(self.path, "small", ids=("A",)),
+            -1,
+        ])
+        self.assertEqual(len(self.model.config["tasks"]), 1)
 
 
 if __name__ == "__main__":

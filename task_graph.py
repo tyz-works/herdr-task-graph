@@ -169,6 +169,48 @@ def load_config(path: Path) -> dict:
     return data
 
 
+def config_signature(path: Path) -> tuple | None:
+    """Identify the file `path` currently resolves to, or None if unreadable.
+
+    os.stat follows symlinks, so replacing the target with os.replace (new
+    inode) or re-pointing the link both change the signature.
+    """
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_mtime_ns, info.st_ino, info.st_size, info.st_dev)
+
+
+def reload_config(model: "DashboardModel", path: Path) -> bool:
+    """Load `path` into the model. On failure keep the last good config and report the error."""
+    # Sampled before reading: a write that lands mid-read is picked up on the next poll.
+    signature = config_signature(path)
+    try:
+        config = load_config(path)
+    except Exception as exc:
+        if isinstance(exc, OSError):
+            message = f"cannot read {path}: {exc.strerror or exc}"
+        else:
+            message = f"{path.name}: {exc}"
+        with model.lock:
+            model.config_error = message
+            model.config_signature = signature
+        return False
+    with model.lock:
+        model.replace_config(config)
+        model.config_error = ""
+        model.config_signature = signature
+    return True
+
+
+def poll_config(model: "DashboardModel", path: Path) -> bool:
+    """Reload only if the file changed since the last attempt (success or not)."""
+    if config_signature(path) == model.config_signature:
+        return False
+    return reload_config(model, path)
+
+
 def topological_levels(tasks: list[dict]) -> list[list[dict]]:
     by_id = {task["id"]: task for task in tasks}
     indegree = {task_id: 0 for task_id in by_id}
@@ -208,6 +250,10 @@ class DashboardModel:
         self.auto_completed: set[str] = set()
         self.connection = "demo"
         self.error = ""
+        # Kept apart from `error` (owned by the Herdr subscriber, cleared on
+        # every snapshot) so a bad tasks.json stays visible until it is fixed.
+        self.config_error = ""
+        self.config_signature: tuple | None = None
         self.compatibility = "unknown"
         self.compatibility_message = "compatibility not checked"
 
@@ -340,7 +386,7 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
         config = model.config
         agents = list(model.agents.values())
         connection = model.connection
-        error = model.error
+        error = model.config_error or model.error
         compatibility = model.compatibility
         compatibility_message = model.compatibility_message
     tasks = config["tasks"]
@@ -671,6 +717,8 @@ def run_tui(stdscr, model: DashboardModel, config_path: Path) -> None:
     attrs = init_colors()
     selected = 0
     while True:
+        poll_config(model, config_path)
+        selected = min(selected, len(model.config["tasks"]) - 1)
         height, width = stdscr.getmaxyx()
         paint(stdscr, render_dashboard(model, width, height, selected), attrs)
         key = stdscr.getch()
@@ -687,14 +735,7 @@ def run_tui(stdscr, model: DashboardModel, config_path: Path) -> None:
             if agent and agent.get("pane_id"):
                 focus_pane(agent["pane_id"])
         elif key == ord("r"):
-            try:
-                model.replace_config(load_config(config_path))
-                with model.lock:
-                    model.error = ""
-                selected = min(selected, len(model.config["tasks"]) - 1)
-            except Exception as exc:
-                with model.lock:
-                    model.error = str(exc)
+            reload_config(model, config_path)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -711,7 +752,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     config_path = find_config(args.config)
+    signature = config_signature(config_path)
     model = DashboardModel(load_config(config_path))
+    model.config_signature = signature
     subscriber: HerdrSubscriber | None = None
     if args.demo:
         model.connection = "demo"
