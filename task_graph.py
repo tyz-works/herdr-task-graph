@@ -393,7 +393,7 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
     levels = topological_levels(tasks)
     states, matches = model.task_states()
     selected = max(0, min(selected, len(tasks) - 1))
-    selected_id = tasks[selected]["id"]
+    selected_id = tasks[selected]["id"] if tasks else None
 
     canvas.put(1, 0, "HERDR  //  TASK GRAPH", "header")
     title = str(config.get("title", "Task graph"))
@@ -635,18 +635,23 @@ class HerdrSubscriber(threading.Thread):
 
 
 def find_config(explicit: str | None) -> Path:
-    candidates: list[Path] = []
+    """Return the tasks.json to use, whether or not it is readable.
+
+    The first configured source wins: --config, HERDR_TASKS_FILE, then an entry
+    named tasks.json in the plugin config dir (a dangling symlink counts, since
+    that means the file is expected but not generated yet). Only when nothing
+    is configured do we fall back to the bundled sample. Callers must report an
+    unreadable result as an error instead of quietly showing something else.
+    """
     if explicit:
-        candidates.append(Path(explicit).expanduser())
+        return Path(explicit).expanduser()
     if os.environ.get("HERDR_TASKS_FILE"):
-        candidates.append(Path(os.environ["HERDR_TASKS_FILE"]).expanduser())
+        return Path(os.environ["HERDR_TASKS_FILE"]).expanduser()
     if os.environ.get("HERDR_PLUGIN_CONFIG_DIR"):
-        candidates.append(Path(os.environ["HERDR_PLUGIN_CONFIG_DIR"]) / "tasks.json")
-    candidates.append(Path(__file__).resolve().with_name("tasks.json"))
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError("tasks.json not found")
+        entry = Path(os.environ["HERDR_PLUGIN_CONFIG_DIR"]) / "tasks.json"
+        if entry.is_symlink() or entry.exists():
+            return entry
+    return Path(__file__).resolve().with_name("tasks.json")
 
 
 def find_socket(explicit: str | None) -> Path:
@@ -718,19 +723,19 @@ def run_tui(stdscr, model: DashboardModel, config_path: Path) -> None:
     selected = 0
     while True:
         poll_config(model, config_path)
-        selected = min(selected, len(model.config["tasks"]) - 1)
+        selected = max(0, min(selected, len(model.config["tasks"]) - 1))
         height, width = stdscr.getmaxyx()
         paint(stdscr, render_dashboard(model, width, height, selected), attrs)
         key = stdscr.getch()
-        task_count = len(model.config["tasks"])
+        tasks = model.config["tasks"]
         if key in (ord("q"), 27):
             return
-        if key in (ord("j"), curses.KEY_DOWN):
-            selected = (selected + 1) % task_count
-        elif key in (ord("k"), curses.KEY_UP):
-            selected = (selected - 1) % task_count
-        elif key in (10, 13, curses.KEY_ENTER):
-            task = model.config["tasks"][selected]
+        if key in (ord("j"), curses.KEY_DOWN) and tasks:
+            selected = (selected + 1) % len(tasks)
+        elif key in (ord("k"), curses.KEY_UP) and tasks:
+            selected = (selected - 1) % len(tasks)
+        elif key in (10, 13, curses.KEY_ENTER) and tasks:
+            task = tasks[selected]
             agent = model.match_agent(task)
             if agent and agent.get("pane_id"):
                 focus_pane(agent["pane_id"])
@@ -752,9 +757,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     config_path = find_config(args.config)
-    signature = config_signature(config_path)
-    model = DashboardModel(load_config(config_path))
-    model.config_signature = signature
+    # Start empty and load through reload_config: an unreadable config is
+    # shown in the dashboard, which keeps watching for the file to appear.
+    model = DashboardModel({"title": "Task graph", "tasks": []})
+    reload_config(model, config_path)
     subscriber: HerdrSubscriber | None = None
     if args.demo:
         model.connection = "demo"
@@ -773,8 +779,10 @@ def main(argv: list[str] | None = None) -> int:
             model.set_compatibility("demo", MAX_VERIFIED_PROTOCOL)
             model.set_agents(demo_agents())
 
+    exit_code = 0
     if args.once:
         print("\n".join(render_dashboard(model, args.width, args.height).plain_lines()))
+        exit_code = 1 if model.config_error else 0
     elif not sys.stdin.isatty() or not sys.stdout.isatty():
         print("Interactive mode requires a TTY. Use --once for a static preview.", file=sys.stderr)
         return 2
@@ -784,7 +792,7 @@ def main(argv: list[str] | None = None) -> int:
     if subscriber:
         subscriber.stop()
         subscriber.join(timeout=1)
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
