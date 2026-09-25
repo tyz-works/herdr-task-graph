@@ -30,6 +30,7 @@ A live terminal DAG for [Herdr](https://herdr.dev/) that shows task dependencies
 - `tasks.json` reloads automatically when it changes.
 - Dependency-derived `READY` and `WAIT` states.
 - Parallel work is visible whenever several tasks are ready at once.
+- Large graphs stay readable: a level too wide for the pane wraps into several rows, and the view scrolls to keep the selected task on screen.
 - Select a task and press Enter to focus its agent pane.
 - Responsive terminal layout with no third-party Python packages.
 - Offline demo and one-shot rendering modes.
@@ -121,6 +122,8 @@ Edit the copied `tasks.json`:
 }
 ```
 
+An optional `label` (string) is shown in the box instead of `id`, which suits long generated ids such as `20260925-my-mission:t004`. It is display only: `depends_on`, uniqueness, and everything else still use `id`. Without a `label` the box shows the `id`; a `label` that is not a string is rejected when the file is loaded.
+
 Map a task to Herdr with either:
 
 - `pane_id`: an exact Herdr pane id.
@@ -132,12 +135,20 @@ Override the configuration path with `HERDR_TASKS_FILE` or `--config`. The first
 
 The file is watched: saving it, replacing it (`os.replace`), or replacing the target of a symlink in the config directory updates the dashboard within a fraction of a second. If the file is missing, unreadable, or invalid, the dashboard keeps showing the last good tasks (or an empty graph at startup) and displays the error until the file is fixed. A configured file that cannot be read is never replaced by the sample.
 
+## Large graphs
+
+Tasks are drawn level by level, and every task without dependencies sits on the first level, so a big plan can put dozens of boxes on one level. A level that does not fit across the pane **wraps into several rows** on one column grid, under a rule such as `-- level 1 · 23 tasks · 12 rows ---`. Boxes never overlap, whatever the width.
+
+A graph taller than the pane **scrolls**: `j`/`k` move the selection through every task and the view follows it. `↑ N more` above and `↓ N more` below the graph count the tasks that are not fully on screen. Connectors scroll with the boxes.
+
+Inside a wrapped level, connectors are drawn only where they cannot be misread: from a box in the last row of its level to a box in the first row of the next. The others are left out (a line running past the boxes stacked in between would look like a dependency on them), so rely on the `waiting: ...` line of a waiting box to see what it is blocked on.
+
 ## Keys
 
 | Key | Action |
 | --- | --- |
-| `j`, `Down` | Select next task |
-| `k`, `Up` | Select previous task |
+| `j`, `Down` | Select next task (scrolls the view when needed) |
+| `k`, `Up` | Select previous task (scrolls the view when needed) |
 | `Enter` | Focus the selected task's agent pane |
 | `r` | Reload `tasks.json` now (changes are also picked up automatically) |
 | `q`, `Esc` | Quit |
