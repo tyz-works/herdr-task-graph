@@ -2,8 +2,8 @@
 """Live task dependency dashboard for Herdr.
 
 The implementation intentionally uses only Python's standard library. It talks
-to Herdr protocol 19 over HERDR_SOCKET_PATH, receives a session snapshot, then
-subscribes to pane.agent_status_changed events.
+to Herdr protocol 19 over HERDR_SOCKET_PATH: one connection for the session
+snapshot, then a separate one subscribed to pane.agent_status_changed events.
 """
 
 from __future__ import annotations
@@ -169,6 +169,48 @@ def load_config(path: Path) -> dict:
     return data
 
 
+def config_signature(path: Path) -> tuple | None:
+    """Identify the file `path` currently resolves to, or None if unreadable.
+
+    os.stat follows symlinks, so replacing the target with os.replace (new
+    inode) or re-pointing the link both change the signature.
+    """
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_mtime_ns, info.st_ino, info.st_size, info.st_dev)
+
+
+def reload_config(model: "DashboardModel", path: Path) -> bool:
+    """Load `path` into the model. On failure keep the last good config and report the error."""
+    # Sampled before reading: a write that lands mid-read is picked up on the next poll.
+    signature = config_signature(path)
+    try:
+        config = load_config(path)
+    except Exception as exc:
+        if isinstance(exc, OSError):
+            message = f"cannot read {path}: {exc.strerror or exc}"
+        else:
+            message = f"{path.name}: {exc}"
+        with model.lock:
+            model.config_error = message
+            model.config_signature = signature
+        return False
+    with model.lock:
+        model.replace_config(config)
+        model.config_error = ""
+        model.config_signature = signature
+    return True
+
+
+def poll_config(model: "DashboardModel", path: Path) -> bool:
+    """Reload only if the file changed since the last attempt (success or not)."""
+    if config_signature(path) == model.config_signature:
+        return False
+    return reload_config(model, path)
+
+
 def topological_levels(tasks: list[dict]) -> list[list[dict]]:
     by_id = {task["id"]: task for task in tasks}
     indegree = {task_id: 0 for task_id in by_id}
@@ -208,6 +250,10 @@ class DashboardModel:
         self.auto_completed: set[str] = set()
         self.connection = "demo"
         self.error = ""
+        # Kept apart from `error` (owned by the Herdr subscriber, cleared on
+        # every snapshot) so a bad tasks.json stays visible until it is fixed.
+        self.config_error = ""
+        self.config_signature: tuple | None = None
         self.compatibility = "unknown"
         self.compatibility_message = "compatibility not checked"
 
@@ -340,14 +386,14 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
         config = model.config
         agents = list(model.agents.values())
         connection = model.connection
-        error = model.error
+        error = model.config_error or model.error
         compatibility = model.compatibility
         compatibility_message = model.compatibility_message
     tasks = config["tasks"]
     levels = topological_levels(tasks)
     states, matches = model.task_states()
     selected = max(0, min(selected, len(tasks) - 1))
-    selected_id = tasks[selected]["id"]
+    selected_id = tasks[selected]["id"] if tasks else None
 
     canvas.put(1, 0, "HERDR  //  TASK GRAPH", "header")
     title = str(config.get("title", "Task graph"))
@@ -491,14 +537,11 @@ class HerdrSubscriber(threading.Thread):
                         self.model.error = str(exc)
                     self.stop_event.wait(0.75)
             finally:
-                if self.sock:
-                    try:
-                        self.sock.close()
-                    except OSError:
-                        pass
-                    self.sock = None
+                self._close()
 
-    def _run_session(self) -> None:
+    def _connect(self) -> socket.socket:
+        # Herdr 0.9.0 closes a connection after one response unless it carries
+        # events.subscribe, so each request type gets its own connection.
         if self.socket_factory:
             self.sock = self.socket_factory()
         else:
@@ -506,18 +549,31 @@ class HerdrSubscriber(threading.Thread):
         self.sock.settimeout(2.0)
         if not self.socket_factory:
             self.sock.connect(str(self.socket_path))
-        stream = self.sock.makefile("r", encoding="utf-8")
-        self.send({"id": "task_graph_snapshot", "method": "session.snapshot", "params": {}})
-        while not self.stop_event.is_set():
-            line = stream.readline()
-            if not line:
-                raise ConnectionError("Herdr socket closed")
-            message = json.loads(line)
-            if message.get("id") == "task_graph_snapshot":
+        return self.sock
+
+    def _close(self) -> None:
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def _fetch_snapshot(self) -> list[dict]:
+        sock = self._connect()
+        stream = sock.makefile("r", encoding="utf-8")
+        try:
+            self.send({"id": "task_graph_snapshot", "method": "session.snapshot", "params": {}})
+            while not self.stop_event.is_set():
+                line = stream.readline()
+                if not line:
+                    raise ConnectionError("Herdr socket closed")
+                message = json.loads(line)
+                if message.get("id") != "task_graph_snapshot":
+                    continue
                 if message.get("error"):
                     raise ConnectionError(message["error"].get("message", "snapshot failed"))
-                result = message.get("result", {})
-                snapshot = result.get("snapshot", {})
+                snapshot = message.get("result", {}).get("snapshot", {})
                 compatibility = self.model.set_compatibility(
                     snapshot.get("version"), snapshot.get("protocol")
                 )
@@ -528,8 +584,37 @@ class HerdrSubscriber(threading.Thread):
                 with self.model.lock:
                     self.model.connection = "live"
                     self.model.error = ""
-                break
+                return agents
+            return []
+        finally:
+            stream.close()
+            self._close()
 
+    def _subscribe(self, subscriptions: list[dict]) -> None:
+        sock = self._connect()
+        stream = sock.makefile("r", encoding="utf-8")
+        try:
+            self.send({
+                "id": "task_graph_events",
+                "method": "events.subscribe",
+                "params": {"subscriptions": subscriptions},
+            })
+            while not self.stop_event.is_set():
+                line = stream.readline()
+                if not line:
+                    raise ConnectionError("Herdr socket closed")
+                message = json.loads(line)
+                if message.get("id") == "task_graph_events" and message.get("error"):
+                    raise ConnectionError(message["error"].get("message", "subscription failed"))
+                if message.get("event") == "pane.agent_status_changed":
+                    self.model.update_agent(message.get("data", {}))
+        finally:
+            stream.close()
+
+    def _run_session(self) -> None:
+        agents = self._fetch_snapshot()
+        if self.stop_event.is_set():
+            return
         subscriptions = [
             {"type": "pane.agent_status_changed", "pane_id": agent["pane_id"]}
             for agent in agents
@@ -537,24 +622,8 @@ class HerdrSubscriber(threading.Thread):
         ]
         if not subscriptions:
             self.stop_event.wait(1.0)
-            stream.close()
             return
-
-        self.send({
-            "id": "task_graph_events",
-            "method": "events.subscribe",
-            "params": {"subscriptions": subscriptions},
-        })
-        while not self.stop_event.is_set():
-            line = stream.readline()
-            if not line:
-                raise ConnectionError("Herdr socket closed")
-            message = json.loads(line)
-            if message.get("id") == "task_graph_events" and message.get("error"):
-                raise ConnectionError(message["error"].get("message", "subscription failed"))
-            if message.get("event") == "pane.agent_status_changed":
-                self.model.update_agent(message.get("data", {}))
-        stream.close()
+        self._subscribe(subscriptions)
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -566,18 +635,23 @@ class HerdrSubscriber(threading.Thread):
 
 
 def find_config(explicit: str | None) -> Path:
-    candidates: list[Path] = []
+    """Return the tasks.json to use, whether or not it is readable.
+
+    The first configured source wins: --config, HERDR_TASKS_FILE, then an entry
+    named tasks.json in the plugin config dir (a dangling symlink counts, since
+    that means the file is expected but not generated yet). Only when nothing
+    is configured do we fall back to the bundled sample. Callers must report an
+    unreadable result as an error instead of quietly showing something else.
+    """
     if explicit:
-        candidates.append(Path(explicit).expanduser())
+        return Path(explicit).expanduser()
     if os.environ.get("HERDR_TASKS_FILE"):
-        candidates.append(Path(os.environ["HERDR_TASKS_FILE"]).expanduser())
+        return Path(os.environ["HERDR_TASKS_FILE"]).expanduser()
     if os.environ.get("HERDR_PLUGIN_CONFIG_DIR"):
-        candidates.append(Path(os.environ["HERDR_PLUGIN_CONFIG_DIR"]) / "tasks.json")
-    candidates.append(Path(__file__).resolve().with_name("tasks.json"))
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError("tasks.json not found")
+        entry = Path(os.environ["HERDR_PLUGIN_CONFIG_DIR"]) / "tasks.json"
+        if entry.is_symlink() or entry.exists():
+            return entry
+    return Path(__file__).resolve().with_name("tasks.json")
 
 
 def find_socket(explicit: str | None) -> Path:
@@ -648,30 +722,25 @@ def run_tui(stdscr, model: DashboardModel, config_path: Path) -> None:
     attrs = init_colors()
     selected = 0
     while True:
+        poll_config(model, config_path)
+        selected = max(0, min(selected, len(model.config["tasks"]) - 1))
         height, width = stdscr.getmaxyx()
         paint(stdscr, render_dashboard(model, width, height, selected), attrs)
         key = stdscr.getch()
-        task_count = len(model.config["tasks"])
+        tasks = model.config["tasks"]
         if key in (ord("q"), 27):
             return
-        if key in (ord("j"), curses.KEY_DOWN):
-            selected = (selected + 1) % task_count
-        elif key in (ord("k"), curses.KEY_UP):
-            selected = (selected - 1) % task_count
-        elif key in (10, 13, curses.KEY_ENTER):
-            task = model.config["tasks"][selected]
+        if key in (ord("j"), curses.KEY_DOWN) and tasks:
+            selected = (selected + 1) % len(tasks)
+        elif key in (ord("k"), curses.KEY_UP) and tasks:
+            selected = (selected - 1) % len(tasks)
+        elif key in (10, 13, curses.KEY_ENTER) and tasks:
+            task = tasks[selected]
             agent = model.match_agent(task)
             if agent and agent.get("pane_id"):
                 focus_pane(agent["pane_id"])
         elif key == ord("r"):
-            try:
-                model.replace_config(load_config(config_path))
-                with model.lock:
-                    model.error = ""
-                selected = min(selected, len(model.config["tasks"]) - 1)
-            except Exception as exc:
-                with model.lock:
-                    model.error = str(exc)
+            reload_config(model, config_path)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -688,7 +757,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     config_path = find_config(args.config)
-    model = DashboardModel(load_config(config_path))
+    # Start empty and load through reload_config: an unreadable config is
+    # shown in the dashboard, which keeps watching for the file to appear.
+    model = DashboardModel({"title": "Task graph", "tasks": []})
+    reload_config(model, config_path)
     subscriber: HerdrSubscriber | None = None
     if args.demo:
         model.connection = "demo"
@@ -707,8 +779,10 @@ def main(argv: list[str] | None = None) -> int:
             model.set_compatibility("demo", MAX_VERIFIED_PROTOCOL)
             model.set_agents(demo_agents())
 
+    exit_code = 0
     if args.once:
         print("\n".join(render_dashboard(model, args.width, args.height).plain_lines()))
+        exit_code = 1 if model.config_error else 0
     elif not sys.stdin.isatty() or not sys.stdout.isatty():
         print("Interactive mode requires a TTY. Use --once for a static preview.", file=sys.stderr)
         return 2
@@ -718,7 +792,7 @@ def main(argv: list[str] | None = None) -> int:
     if subscriber:
         subscriber.stop()
         subscriber.join(timeout=1)
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ A live terminal DAG for [Herdr](https://herdr.dev/) that shows task dependencies
 ## Features
 
 - Live Herdr state from `session.snapshot` and `pane.agent_status_changed`.
+- `tasks.json` reloads automatically when it changes.
 - Dependency-derived `READY` and `WAIT` states.
 - Parallel work is visible whenever several tasks are ready at once.
 - Select a task and press Enter to focus its agent pane.
@@ -39,6 +40,8 @@ A live terminal DAG for [Herdr](https://herdr.dev/) that shows task dependencies
 - Herdr 0.8.0 or newer
 - Python 3.11 or newer
 - macOS or Linux
+
+The plugin uses one socket connection for `session.snapshot` and another for `events.subscribe`, because Herdr 0.9.0 closes a connection after one response unless it carries a subscription. The snapshot is taken again each time the subscription reconnects, so agents started later are picked up.
 
 Herdr 0.8.x protocol 19 through Herdr 0.9.0/0.9.1 protocol 22 are treated as verified. Older protocols are rejected. A newer, unverified protocol produces a visible warning and continues in read-only mode.
 
@@ -125,7 +128,9 @@ Map a task to Herdr with either:
 
 An optional fixed `status` may be `done`, `running`, `blocked`, `ready`, `waiting`, or `failed`. Without it, status is derived from Herdr and the task dependencies.
 
-Override the configuration path with `HERDR_TASKS_FILE` or `--config`.
+Override the configuration path with `HERDR_TASKS_FILE` or `--config`. The first one that is set wins, then a `tasks.json` entry in the plugin config directory. The bundled sample is shown only when none of them is configured.
+
+The file is watched: saving it, replacing it (`os.replace`), or replacing the target of a symlink in the config directory updates the dashboard within a fraction of a second. If the file is missing, unreadable, or invalid, the dashboard keeps showing the last good tasks (or an empty graph at startup) and displays the error until the file is fixed. A configured file that cannot be read is never replaced by the sample.
 
 ## Keys
 
@@ -134,7 +139,7 @@ Override the configuration path with `HERDR_TASKS_FILE` or `--config`.
 | `j`, `Down` | Select next task |
 | `k`, `Up` | Select previous task |
 | `Enter` | Focus the selected task's agent pane |
-| `r` | Reload `tasks.json` |
+| `r` | Reload `tasks.json` now (changes are also picked up automatically) |
 | `q`, `Esc` | Quit |
 
 ## Development
