@@ -2,8 +2,8 @@
 """Live task dependency dashboard for Herdr.
 
 The implementation intentionally uses only Python's standard library. It talks
-to Herdr protocol 19 over HERDR_SOCKET_PATH, receives a session snapshot, then
-subscribes to pane.agent_status_changed events.
+to Herdr protocol 19 over HERDR_SOCKET_PATH: one connection for the session
+snapshot, then a separate one subscribed to pane.agent_status_changed events.
 """
 
 from __future__ import annotations
@@ -491,14 +491,11 @@ class HerdrSubscriber(threading.Thread):
                         self.model.error = str(exc)
                     self.stop_event.wait(0.75)
             finally:
-                if self.sock:
-                    try:
-                        self.sock.close()
-                    except OSError:
-                        pass
-                    self.sock = None
+                self._close()
 
-    def _run_session(self) -> None:
+    def _connect(self) -> socket.socket:
+        # Herdr 0.9.0 closes a connection after one response unless it carries
+        # events.subscribe, so each request type gets its own connection.
         if self.socket_factory:
             self.sock = self.socket_factory()
         else:
@@ -506,18 +503,31 @@ class HerdrSubscriber(threading.Thread):
         self.sock.settimeout(2.0)
         if not self.socket_factory:
             self.sock.connect(str(self.socket_path))
-        stream = self.sock.makefile("r", encoding="utf-8")
-        self.send({"id": "task_graph_snapshot", "method": "session.snapshot", "params": {}})
-        while not self.stop_event.is_set():
-            line = stream.readline()
-            if not line:
-                raise ConnectionError("Herdr socket closed")
-            message = json.loads(line)
-            if message.get("id") == "task_graph_snapshot":
+        return self.sock
+
+    def _close(self) -> None:
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def _fetch_snapshot(self) -> list[dict]:
+        sock = self._connect()
+        stream = sock.makefile("r", encoding="utf-8")
+        try:
+            self.send({"id": "task_graph_snapshot", "method": "session.snapshot", "params": {}})
+            while not self.stop_event.is_set():
+                line = stream.readline()
+                if not line:
+                    raise ConnectionError("Herdr socket closed")
+                message = json.loads(line)
+                if message.get("id") != "task_graph_snapshot":
+                    continue
                 if message.get("error"):
                     raise ConnectionError(message["error"].get("message", "snapshot failed"))
-                result = message.get("result", {})
-                snapshot = result.get("snapshot", {})
+                snapshot = message.get("result", {}).get("snapshot", {})
                 compatibility = self.model.set_compatibility(
                     snapshot.get("version"), snapshot.get("protocol")
                 )
@@ -528,8 +538,37 @@ class HerdrSubscriber(threading.Thread):
                 with self.model.lock:
                     self.model.connection = "live"
                     self.model.error = ""
-                break
+                return agents
+            return []
+        finally:
+            stream.close()
+            self._close()
 
+    def _subscribe(self, subscriptions: list[dict]) -> None:
+        sock = self._connect()
+        stream = sock.makefile("r", encoding="utf-8")
+        try:
+            self.send({
+                "id": "task_graph_events",
+                "method": "events.subscribe",
+                "params": {"subscriptions": subscriptions},
+            })
+            while not self.stop_event.is_set():
+                line = stream.readline()
+                if not line:
+                    raise ConnectionError("Herdr socket closed")
+                message = json.loads(line)
+                if message.get("id") == "task_graph_events" and message.get("error"):
+                    raise ConnectionError(message["error"].get("message", "subscription failed"))
+                if message.get("event") == "pane.agent_status_changed":
+                    self.model.update_agent(message.get("data", {}))
+        finally:
+            stream.close()
+
+    def _run_session(self) -> None:
+        agents = self._fetch_snapshot()
+        if self.stop_event.is_set():
+            return
         subscriptions = [
             {"type": "pane.agent_status_changed", "pane_id": agent["pane_id"]}
             for agent in agents
@@ -537,24 +576,8 @@ class HerdrSubscriber(threading.Thread):
         ]
         if not subscriptions:
             self.stop_event.wait(1.0)
-            stream.close()
             return
-
-        self.send({
-            "id": "task_graph_events",
-            "method": "events.subscribe",
-            "params": {"subscriptions": subscriptions},
-        })
-        while not self.stop_event.is_set():
-            line = stream.readline()
-            if not line:
-                raise ConnectionError("Herdr socket closed")
-            message = json.loads(line)
-            if message.get("id") == "task_graph_events" and message.get("error"):
-                raise ConnectionError(message["error"].get("message", "subscription failed"))
-            if message.get("event") == "pane.agent_status_changed":
-                self.model.update_agent(message.get("data", {}))
-        stream.close()
+        self._subscribe(subscriptions)
 
     def stop(self) -> None:
         self.stop_event.set()

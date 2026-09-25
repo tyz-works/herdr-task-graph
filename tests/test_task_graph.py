@@ -1,6 +1,8 @@
 import importlib.util
 import json
+import shutil
 import socket
+import tempfile
 import threading
 import time
 import unittest
@@ -68,76 +70,134 @@ class TaskGraphTests(unittest.TestCase):
         self.assertIn("[RUN] B", output)
         self.assertIn("[READY] E", output)
 
-    def test_socket_snapshot_and_status_event(self):
-        config = {
-            "title": "socket test",
-            "tasks": [
-                {"id": "A", "title": "A", "depends_on": [], "pane_id": "w1:p1"},
-            ],
-        }
-        model = task_graph.DashboardModel(config)
-        received = []
 
-        client, server = socket.socketpair()
+class OneRequestHerdrServer:
+    """Fake Herdr 0.9.0 socket server.
 
-        def fake_server():
-            stream = server.makefile("r", encoding="utf-8")
-            request = json.loads(stream.readline())
-            received.append(request)
-            response = {
-                "id": "task_graph_snapshot",
-                "result": {
-                    "type": "session_snapshot",
-                        "snapshot": {
-                            "version": "0.9.1",
-                            "protocol": 22,
-                            "agents": [{
-                            "pane_id": "w1:p1",
-                            "name": "codex-api",
-                            "agent_status": "idle",
-                        }]
+    Like the real server, every connection serves a single request and is then
+    closed, except ``events.subscribe`` which keeps the connection open.
+    """
+
+    def __init__(self, agents, events=()):
+        self.agents = agents
+        self.events = list(events)
+        self.requests = []
+        self.connections = 0
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.tmpdir = tempfile.mkdtemp(prefix="hg")
+        self.path = Path(self.tmpdir) / "h.sock"
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(self.path))
+        self.listener.listen(8)
+        self.listener.settimeout(0.1)
+        self.thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self.thread.start()
+
+    def _accept_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                conn, _ = self.listener.accept()
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError:
+                return
+            with self.lock:
+                self.connections += 1
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _reply(self, conn, payload):
+        conn.sendall((json.dumps(payload) + "\n").encode())
+
+    def _serve(self, conn):
+        stream = conn.makefile("r", encoding="utf-8")
+        try:
+            line = stream.readline()
+            if not line:
+                return
+            request = json.loads(line)
+            with self.lock:
+                self.requests.append(request)
+            if request["method"] == "session.snapshot":
+                self._reply(conn, {
+                    "id": request["id"],
+                    "result": {
+                        "type": "session_snapshot",
+                        "snapshot": {"version": "0.9.0", "protocol": 22, "agents": self.agents},
                     },
-                },
-            }
-            server.sendall((json.dumps(response) + "\n").encode())
-            request = json.loads(stream.readline())
-            received.append(request)
-            server.sendall((json.dumps({
-                "id": "task_graph_events",
-                "result": {"type": "subscription_started"},
-            }) + "\n").encode())
-            server.sendall((json.dumps({
-                "event": "pane.agent_status_changed",
-                "data": {
-                    "pane_id": "w1:p1",
-                    "workspace_id": "w1",
-                    "agent_status": "working",
-                },
-            }) + "\n").encode())
-            time.sleep(0.2)
+                })
+            elif request["method"] == "events.subscribe":
+                self._reply(conn, {"id": request["id"], "result": {"type": "subscription_started"}})
+                for event in self.events:
+                    self._reply(conn, event)
+                self.stop_event.wait(5)
+            else:
+                self._reply(conn, {"id": request["id"], "error": {"message": "unknown method"}})
+        except OSError:
+            pass
+        finally:
             stream.close()
-            server.close()
+            conn.close()
 
-        server_thread = threading.Thread(target=fake_server, daemon=True)
-        server_thread.start()
-        subscriber = task_graph.HerdrSubscriber(model, Path("unused"), socket_factory=lambda: client)
+    def methods(self):
+        with self.lock:
+            return [request["method"] for request in self.requests]
+
+    def close(self):
+        self.stop_event.set()
+        self.listener.close()
+        self.thread.join(timeout=1)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+
+def wait_until(predicate, timeout=3.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+class SubscriberTests(unittest.TestCase):
+    def run_subscriber(self, server, model):
+        subscriber = task_graph.HerdrSubscriber(model, server.path)
         subscriber.start()
-        deadline = time.time() + 1
-        while time.time() < deadline:
-            states, _ = model.task_states()
-            if states["A"] == "running":
-                break
-            time.sleep(0.01)
-        subscriber.stop()
-        subscriber.join(timeout=1)
-        server_thread.join(timeout=1)
+        self.addCleanup(server.close)
+        self.addCleanup(subscriber.join, 2)
+        self.addCleanup(subscriber.stop)
+        return subscriber
 
-        states, _ = model.task_states()
-        self.assertEqual(states["A"], "running")
+    def test_snapshot_and_subscribe_use_separate_connections(self):
+        config = {"title": "socket test", "tasks": [{"id": "A", "title": "A", "depends_on": [], "pane_id": "w1:p1"}]}
+        model = task_graph.DashboardModel(config)
+        server = OneRequestHerdrServer(
+            agents=[{"pane_id": "w1:p1", "name": "codex-api", "agent_status": "idle"}],
+            events=[{
+                "event": "pane.agent_status_changed",
+                "data": {"pane_id": "w1:p1", "workspace_id": "w1", "agent_status": "working"},
+            }],
+        )
+        self.run_subscriber(server, model)
+
+        self.assertTrue(wait_until(lambda: model.task_states()[0]["A"] == "running"), model.error)
+        self.assertEqual(model.connection, "live")
+        self.assertEqual(model.error, "")
         self.assertEqual(model.compatibility, "compatible")
-        self.assertIn("Herdr 0.9.1", model.compatibility_message)
-        self.assertEqual(received[0]["method"], "session.snapshot")
-        self.assertEqual(received[1]["params"]["subscriptions"][0]["pane_id"], "w1:p1")
+        self.assertIn("Herdr 0.9.0", model.compatibility_message)
+        self.assertEqual(server.methods(), ["session.snapshot", "events.subscribe"])
+        self.assertEqual(server.requests[1]["params"]["subscriptions"][0]["pane_id"], "w1:p1")
+        self.assertEqual(server.connections, 2)
+
+    def test_no_agents_stays_live_without_subscribing(self):
+        config = {"title": "empty", "tasks": [{"id": "A", "title": "A", "depends_on": []}]}
+        model = task_graph.DashboardModel(config)
+        server = OneRequestHerdrServer(agents=[])
+        self.run_subscriber(server, model)
+
+        self.assertTrue(wait_until(lambda: model.connection == "live"), model.error)
+        self.assertEqual(model.error, "")
+        self.assertEqual(server.methods(), ["session.snapshot"])
 
 
 if __name__ == "__main__":
