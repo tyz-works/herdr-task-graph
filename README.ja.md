@@ -70,6 +70,8 @@ cp tasks.json "$config_dir/tasks.json"
 
 表示名として`label`（文字列、任意）を指定すると、箱には`id`の代わりに`label`が表示されます。`20260925-my-mission:t004`のような長い自動生成idに向いています。`label`は表示専用で、`depends_on`・一意性の検査など識別はすべて`id`のままです。`label`がなければ`id`を表示し、文字列以外の`label`は読み込み時にエラーになります。
 
+箱は3行で、`[STATE] label`、タイトルだけの行、待機先または担当エージェントの行です。箱の幅はペインに合わせて28〜48桁まで広がり、タイトルを読めるようにします。任意の`group`（文字列）を指定すると、1行目の右端にその末尾が`· …task-graph`のように表示され、複数のmissionで`label`が重なるタスクを見分けられます。pluginにとって意味のない汎用の欄で、`label`と同じく表示専用です。長い`group`でも`label`は押し出されません。文字列以外の`group`は読み込み時にエラーになります。
+
 固定状態には`status`を指定できます。値は`done`、`running`、`blocked`、`ready`、`waiting`、`failed`です。省略するとHerdr状態と依存関係から自動判定します。
 
 別の設定ファイルは`HERDR_TASKS_FILE`環境変数または`--config`で指定できます。指定されているものが優先され（`--config`、`HERDR_TASKS_FILE`、設定ディレクトリの`tasks.json`の順）、どれも指定されていないときだけ同梱のサンプルを表示します。

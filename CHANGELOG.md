@@ -8,6 +8,8 @@ All notable changes to this project are documented here.
 - Scroll the graph vertically so the selected task is always on screen and `j`/`k` reach every task. Rows that used to be silently dropped when they did not fit are now reachable; `↑ N more` / `↓ N more` show what is off screen, and connectors scroll with the boxes. The scroll position stays put while the selection moves inside the view.
 - Inside a wrapped level, connectors are drawn only from the last row of a level to the first row of the next, because a line passing the boxes stacked in between would read as a dependency on them.
 - Add an optional `label` (string) to tasks. A box shows the `label` instead of the `id` (and `waiting:` names dependencies by label), so long generated ids no longer push the title out of the box. Identity is unchanged: dependencies and the uniqueness check use `id`. A `label` that is not a string is rejected when the file is loaded.
+- Give the title its own line in every box (a box is now 5 rows: `[STATE] label`, title, meta) and widen boxes into spare pane width (28 to 48 columns). Titles used to get about 9 cells after the label; they now get at least 20 at widths 80, 120 and 200, also when the id is long and there is no `label`. A box that a scroll would cut in half is blanked and counted in `↑ N more` / `↓ N more` instead of being drawn without a border.
+- Add an optional `group` (string) to tasks, shown as its tail at the right end of a box's first line so tasks with the same `label` from different missions can be told apart. Display only; it gives way before the label does. A `group` that is not a string is rejected when the file is loaded.
 
 ## 0.2.0 - 2026-09-26
 

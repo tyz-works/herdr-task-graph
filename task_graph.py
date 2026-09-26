@@ -83,6 +83,11 @@ def clip(text: str, width: int) -> str:
     return "".join(result)
 
 
+def clip_tail(text: str, width: int) -> str:
+    """The last `width` cells of `text`; the distinguishing part of a slug is usually its end."""
+    return clip(text[::-1], width)[::-1] if width > 0 else ""
+
+
 def fit(text: str, width: int, align: str = "left") -> str:
     text = clip(text, width)
     padding = max(0, width - cell_width(text))
@@ -144,6 +149,12 @@ class Canvas:
                 self.cells[dst_row][x:end] = source.cells[src_row][x:end]
                 self.styles[dst_row][x:end] = source.styles[src_row][x:end]
 
+    def clear(self, x: int, y: int, width: int, rows: int) -> None:
+        for row in range(max(0, y), min(self.height, y + rows)):
+            for col in range(max(0, x), min(self.width, x + width)):
+                self.cells[row][col] = " "
+                self.styles[row][col] = "normal"
+
     def plain_lines(self) -> list[str]:
         return ["".join(row).rstrip() for row in self.cells]
 
@@ -167,6 +178,8 @@ def load_config(path: Path) -> dict:
             raise ValueError(f"depends_on must be an array: {task_id}")
         if "label" in task and not isinstance(task["label"], str):
             raise ValueError(f"label must be a string: {task_id}")
+        if "group" in task and not isinstance(task["group"], str):
+            raise ValueError(f"group must be a string: {task_id}")
         status = task.get("status")
         if status is not None and status not in VALID_MANUAL_STATES:
             raise ValueError(f"invalid status for {task_id}: {status}")
@@ -395,8 +408,10 @@ def state_style(state: str) -> str:
     }.get(state, "normal")
 
 
-BOX_WIDTH = 28
-BOX_HEIGHT = 4
+MIN_BOX_WIDTH = 28
+MAX_BOX_WIDTH = 48  # boxes grow into spare width up to this, so titles have room
+BOX_HEIGHT = 5  # border, "[STATE] label", title, meta, border
+GROUP_WIDTH = 12  # cells of a task's group shown at the right end of the first line
 BOX_GAP = 3  # blank columns between boxes in a row
 ROW_GAP = 1  # blank rows between the rows of a wrapped level
 LEVEL_GAP = 4  # rows between levels; the connectors run through them
@@ -408,6 +423,29 @@ VIEW_RESERVED_ROWS = 9  # screen rows that are not graph: header (5), "↓ N mor
 def task_name(task: dict) -> str:
     """What a box calls the task: its label if it has one, otherwise its id."""
     return task.get("label") or task["id"]
+
+
+def box_width_for(graph_width: int) -> int:
+    """Box width for a graph area: as many MIN_BOX_WIDTH columns as fit, widened to use the spare width."""
+    if graph_width < 64:
+        return max(18, graph_width - 2)
+    columns = (graph_width + BOX_GAP) // (MIN_BOX_WIDTH + BOX_GAP)
+    return min(MAX_BOX_WIDTH, (graph_width + BOX_GAP) // columns - BOX_GAP)
+
+
+def box_header(task: dict, marker: str, state: str, name: str, inner: int) -> str:
+    """First box line: marker, state and name, with the tail of the task's group flush right.
+
+    The group only takes the room the name leaves over; it never clips the name.
+    """
+    left = clip(f"{marker} [{STATE_LABEL[state]}] {name}", inner)
+    group = task.get("group") or ""
+    room = min(GROUP_WIDTH, inner - cell_width(left) - 5)  # 5: " · " before and " " after
+    if not group or room < 3:
+        return fit(left, inner)
+    tail = group if cell_width(group) <= room else "…" + clip_tail(group, room - 1)
+    right = f" · {tail} "
+    return fit(left, inner - cell_width(right)) + right
 
 
 class GraphLayout(NamedTuple):
@@ -499,7 +537,7 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
     )
     canvas.put(compat_x, 3, clip(compatibility_message, max(0, width - compat_x - 1)), compat_style)
 
-    box_width = BOX_WIDTH if graph_width >= 64 else max(18, graph_width - 2)
+    box_width = box_width_for(graph_width)
     layout = layout_graph(levels, graph_x, graph_width, box_width)
     positions, graph_height = layout.positions, layout.height
     names = {task["id"]: task_name(task) for task in tasks}
@@ -543,8 +581,9 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
         style = state_style(state)
         graph.put(x, y, "+" + "-" * (box_width - 2) + "+", style)
         marker = ">" if task_id == selected_id else " "
-        label = f"{marker} [{STATE_LABEL[state]}] {names[task_id]}  {task['title']}"
-        graph.put(x, y + 1, "|" + fit(label, box_width - 2) + "|", style)
+        inner = box_width - 2
+        graph.put(x, y + 1, "|" + box_header(task, marker, state, names[task_id], inner) + "|", style)
+        graph.put(x, y + 2, "|" + fit("  " + str(task["title"]), inner) + "|", style)
         agent = matches.get(task_id)
         if agent:
             meta = f"{agent_name(agent)} · {agent.get('agent_status', 'unknown')}"
@@ -556,8 +595,8 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
             meta = "ready · parallel" if ready_count > 1 else "ready"
         else:
             meta = ""
-        graph.put(x, y + 2, "|" + fit(meta, box_width - 2, "center") + "|", style)
-        graph.put(x, y + 3, "+" + "-" * (box_width - 2) + "+", style)
+        graph.put(x, y + 3, "|" + fit(meta, inner, "center") + "|", style)
+        graph.put(x, y + 4, "+" + "-" * (box_width - 2) + "+", style)
 
     view_height = max(0, height - VIEW_RESERVED_ROWS)
     with model.lock:
@@ -572,8 +611,19 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
         top = max(0, min(top, graph_height - view_height))
         model.view_top = top
     canvas.blit(graph, top, VIEW_TOP, view_height, graph_x)
-    above = sum(y < top for _, y in positions.values())
-    below = sum(y + BOX_HEIGHT > top + view_height for _, y in positions.values())
+    # A box cut by the top or bottom edge would be missing a border, so it is
+    # blanked out and counted as hidden along with the boxes fully off screen.
+    above = below = 0
+    for x, y in positions.values():
+        if y < top:
+            above += 1
+        elif y + BOX_HEIGHT > top + view_height:
+            below += 1
+        else:
+            continue
+        first = max(VIEW_TOP, VIEW_TOP + y - top)
+        last = min(VIEW_TOP + view_height, VIEW_TOP + y - top + BOX_HEIGHT)
+        canvas.clear(x, first, box_width, last - first)
     if above:
         canvas.put(graph_x + 1, VIEW_TOP - 1, f"↑ {above} more", "yellow")
     if below:

@@ -124,6 +124,8 @@ Edit the copied `tasks.json`:
 
 An optional `label` (string) is shown in the box instead of `id`, which suits long generated ids such as `20260925-my-mission:t004`. It is display only: `depends_on`, uniqueness, and everything else still use `id`. Without a `label` the box shows the `id`; a `label` that is not a string is rejected when the file is loaded.
 
+A box has three lines: `[STATE] label`, the title on a line of its own, and what the task is waiting for or which agent runs it. Boxes widen with the pane (28 to 48 columns) so the title stays readable. An optional `group` (string) is shown as its tail at the right end of the first line (`· …task-graph`), which tells apart tasks that share a `label` across missions. It is generic: the plugin attaches no meaning to it, it is display only like `label`, and it never pushes the label out of the box. A `group` that is not a string is rejected when the file is loaded.
+
 Map a task to Herdr with either:
 
 - `pane_id`: an exact Herdr pane id.

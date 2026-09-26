@@ -470,7 +470,10 @@ class ConfigResolutionTests(unittest.TestCase):
         self.assertIn("[READY] A", seen["after"])
 
 
-def crewvia_like_config(long_ids=False, labels=False):
+LONG_TITLE = "プラグインの箱でタイトルを読めるようにする長い日本語のタイトル"
+
+
+def crewvia_like_config(long_ids=False, labels=False, groups=False, long_titles=False):
     """55 tasks from 2 missions: 23 dependency-free tasks share the first level.
 
     This is the shape crewvia produces (every mission starts with independent
@@ -484,11 +487,13 @@ def crewvia_like_config(long_ids=False, labels=False):
             task_id = f"{slug}:t{number:03d}" if long_ids else f"t{number:03d}"
             task = {
                 "id": task_id,
-                "title": f"Task {number:03d}",
+                "title": LONG_TITLE if long_titles else f"Task {number:03d}",
                 "depends_on": [] if index < roots else [ids[index - roots]],
             }
             if labels:
                 task["label"] = f"t{number:03d}"
+            if groups:
+                task["group"] = slug
             if number <= 5:
                 task["status"] = "done"
             ids.append(task_id)
@@ -496,32 +501,51 @@ def crewvia_like_config(long_ids=False, labels=False):
     return {"title": "crewvia", "tasks": tasks}
 
 
-BOX_WIDTH = 28
-BOX_BORDER = "+" + "-" * (BOX_WIDTH - 2) + "+"
 BOX_TAG = re.compile(r"\|([> ]) \[(DONE|RUN|READY|WAIT|BLOCK|FAIL|UNKNOWN)\] (\S*)")
+BORDER = re.compile(r"\+-+\+")
+MAX_BOX_ROWS = 8  # how far below its name line a box may end before it counts as broken
+
+
+def grid_lines(canvas):
+    """Screen rows with one string index per terminal column.
+
+    plain_lines() drops the filler cell behind a wide character, so indexes
+    drift after Japanese text; here that cell becomes a NUL and the rows are
+    not stripped.
+    """
+    return ["".join(cell or "\0" for cell in row) for row in canvas.cells]
 
 
 def drawn_boxes(lines):
-    """Boxes found in a rendered frame as (name, selected, intact, row, col, text).
+    """Boxes found in a rendered frame, as dicts.
 
-    A box is intact when both borders and the closing bar sit exactly where the
-    label line says they should, which only holds if nothing was drawn over it.
-    ASCII-only fixtures keep string indexes equal to terminal columns.
+    Keys: name, selected, intact, row (the name line), col, width, bottom (row
+    of the bottom border), text (the name line) and body (every line inside
+    the box, NULs removed). The width is read off the top border, and a box is
+    intact when its closing bars and bottom border sit where that width says,
+    which only holds if nothing was drawn over it. Box height is not assumed.
     """
     boxes = []
     for row, line in enumerate(lines):
         for match in BOX_TAG.finditer(line):
             col = match.start()
-            top = lines[row - 1][col:col + BOX_WIDTH] if row >= 1 else ""
-            bottom = lines[row + 2][col:col + BOX_WIDTH] if row + 2 < len(lines) else ""
-            intact = top == BOX_BORDER and bottom == BOX_BORDER and line[col + BOX_WIDTH - 1:col + BOX_WIDTH] == "|"
+            border = BORDER.match(lines[row - 1], col) if row >= 1 else None
+            width = border.end() - col if border else 0
+            bottom = next((r for r in range(row + 1, min(len(lines), row + MAX_BOX_ROWS))
+                           if width and lines[r][col:col + width] == border.group(0)), None)
+            inside = range(row, bottom) if bottom else ()
+            intact = bool(border) and bottom is not None and all(
+                lines[r][col] == "|" and lines[r][col + width - 1] == "|" for r in inside)
             boxes.append({
                 "name": match.group(3),
                 "selected": match.group(1) == ">",
                 "intact": intact,
                 "row": row,
                 "col": col,
-                "text": line[col:col + BOX_WIDTH],
+                "width": width,
+                "bottom": bottom,
+                "text": line[col:col + width],
+                "body": "\n".join(lines[r][col + 1:col + width - 1].replace("\0", "") for r in inside),
             })
     return boxes
 
@@ -562,7 +586,7 @@ class ReadableLayoutTests(unittest.TestCase):
                     # overlapped boxes lose their labels and go undetected, so also demand a healthy count
                     self.assertGreaterEqual(len(boxes), 4, boxes)
                     self.assertTrue(all(box["intact"] for box in boxes), boxes)
-                    rects = [(b["row"] - 1, b["row"] + 2, b["col"], b["col"] + BOX_WIDTH - 1) for b in boxes]
+                    rects = [(b["row"] - 1, b["bottom"], b["col"], b["col"] + b["width"] - 1) for b in boxes]
                     for i, a in enumerate(rects):
                         for b in rects[i + 1:]:
                             disjoint = a[1] < b[0] or b[1] < a[0] or a[3] < b[2] or b[3] < a[2]
@@ -644,7 +668,7 @@ class ReadableLayoutTests(unittest.TestCase):
                 self.assertEqual(box["name"], f"c{selected:02d}")
                 if selected:
                     arrival = lines[box["row"] - 2]  # the row directly above the top border
-                    self.assertEqual(arrival[box["col"] + BOX_WIDTH // 2], "v")
+                    self.assertEqual(arrival[box["col"] + box["width"] // 2], "v")
                 # rows 2-3 hold the title bar, row 4 and row -4 only the "more" markers
                 self.assertRegex(lines[4].strip(), r"^(↑ \d+ more)?$")
                 self.assertRegex(lines[-4].strip(), r"^(↓ \d+ more)?$")
@@ -652,10 +676,11 @@ class ReadableLayoutTests(unittest.TestCase):
 
     def test_a_small_graph_keeps_its_original_layout(self):
         model = task_graph.DashboardModel(task_graph.load_config(ROOT / "tasks.json"))
-        text = "\n".join(task_graph.render_dashboard(model, 120, 36).plain_lines())
+        lines = grid_lines(task_graph.render_dashboard(model, 120, 36))
+        text = "\n".join(lines)
         self.assertNotIn("more", text)
         self.assertNotIn("level 1", text)
-        boxes = drawn_boxes(text.split("\n"))
+        boxes = drawn_boxes(lines)
         self.assertEqual(sorted(box["name"] for box in boxes), ["A", "B", "C", "D", "E"])
 
 
@@ -672,13 +697,16 @@ class LabelTests(unittest.TestCase):
                 self.assertGreaterEqual(len(boxes), 2)
                 for box in boxes:
                     number = box["name"][1:]
-                    self.assertRegex(box["text"], rf"\[(DONE|READY)\] t{number}  Task {number}")
-                    self.assertNotIn("20260924", box["text"])
+                    self.assertRegex(box["text"], r"\[(DONE|READY)\] t" + number)
+                    self.assertIn(f"Task {number}", box["body"])
+                    self.assertNotIn("20260924", box["body"])
 
     def test_without_label_the_box_shows_the_id(self):
         model = task_graph.DashboardModel(task_graph.load_config(ROOT / "tasks.json"))
-        text = "\n".join(task_graph.render_dashboard(model, 120, 36).plain_lines())
-        self.assertIn("[DONE] A  要件整理", text)
+        boxes = drawn_boxes(grid_lines(task_graph.render_dashboard(model, 120, 36)))
+        box = next(box for box in boxes if box["name"] == "A")
+        self.assertIn("[DONE] A", box["text"])
+        self.assertIn("要件整理", box["body"])
 
     def test_waiting_line_uses_the_label_of_the_dependency(self):
         config = {"title": "t", "tasks": [
@@ -709,6 +737,114 @@ class LabelTests(unittest.TestCase):
             with self.subTest(label=bad):
                 config = {"title": "t", "tasks": [{"id": "a", "label": bad, "depends_on": []}]}
                 with self.assertRaisesRegex(ValueError, "label must be a string: a"):
+                    task_graph.load_config(self.write(config))
+
+    def write(self, config):
+        tmp = Path(tempfile.mkdtemp(prefix="hg"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = tmp / "tasks.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        return path
+
+
+def visible_title_cells(box, title):
+    """Display width of the longest start of `title` found anywhere inside the box."""
+    for length in range(len(title), 0, -1):
+        if title[:length] in box["body"]:
+            return task_graph.cell_width(title[:length])
+    return 0
+
+
+class TitleReadabilityTests(unittest.TestCase):
+    """The shape from the t005 QA: `<slug>:tNNN` ids, `label: tNNN`, long Japanese titles."""
+
+    WIDTHS = (80, 120, 200)
+    MIN_TITLE_CELLS = 20
+
+    def check_titles(self, config):
+        model = task_graph.DashboardModel(config)
+        for width in self.WIDTHS:
+            with self.subTest(width=width):
+                boxes = drawn_boxes(grid_lines(task_graph.render_dashboard(model, width, 36, 0)))
+                # boxes that lose their name line go undetected, so demand a healthy count
+                self.assertGreaterEqual(len(boxes), 4, boxes)
+                for box in boxes:
+                    self.assertTrue(box["intact"], box)
+                    self.assertGreaterEqual(visible_title_cells(box, LONG_TITLE), self.MIN_TITLE_CELLS, box)
+
+    def test_title_is_readable_with_a_label(self):
+        self.check_titles(crewvia_like_config(long_ids=True, labels=True, long_titles=True))
+
+    def test_title_is_readable_without_a_label(self):
+        # the id fills the name line; the title must not depend on what is left of it
+        self.check_titles(crewvia_like_config(long_ids=True, long_titles=True))
+
+    def test_title_is_readable_with_a_group(self):
+        self.check_titles(crewvia_like_config(long_ids=True, labels=True, groups=True, long_titles=True))
+
+    def test_boxes_use_spare_width_but_stay_within_bounds(self):
+        for width in self.WIDTHS:
+            with self.subTest(width=width):
+                model = task_graph.DashboardModel(crewvia_like_config(labels=True))
+                boxes = drawn_boxes(grid_lines(task_graph.render_dashboard(model, width, 36, 0)))
+                self.assertGreaterEqual(len(boxes), 2)
+                for box in boxes:
+                    self.assertTrue(task_graph.MIN_BOX_WIDTH <= box["width"] <= task_graph.MAX_BOX_WIDTH, box)
+
+    def test_a_narrow_pane_still_draws_intact_boxes(self):
+        model = task_graph.DashboardModel(crewvia_like_config(long_ids=True, labels=True, groups=True))
+        boxes = drawn_boxes(grid_lines(task_graph.render_dashboard(model, 50, 30, 0)))
+        self.assertGreaterEqual(len(boxes), 2)
+        self.assertTrue(all(box["intact"] for box in boxes), boxes)
+
+
+class GroupTests(unittest.TestCase):
+    def render(self, tasks, width=120):
+        model = task_graph.DashboardModel({"title": "t", "tasks": tasks})
+        return drawn_boxes(grid_lines(task_graph.render_dashboard(model, width, 36, 0)))
+
+    def test_group_is_shown_at_the_right_end_of_the_name_line(self):
+        [box] = self.render([{"id": "a", "label": "t001", "title": "one", "group": "mission-x"}])
+        self.assertRegex(box["text"], r"\[READY\] t001\s+· mission-x \|$")
+
+    def test_a_long_group_keeps_its_tail(self):
+        [box] = self.render([{"id": "a", "label": "t001", "title": "one", "group": "20260925-task-graph-usable"}])
+        self.assertIn("·", box["text"])
+        self.assertRegex(box["text"], r"…\S*usable \|$")
+        self.assertNotIn("20260925", box["text"])
+
+    def test_missions_with_the_same_label_are_told_apart(self):
+        first, second = self.render([
+            {"id": "m1:t001", "label": "t001", "title": "one", "group": "20260924-alpha"},
+            {"id": "m2:t001", "label": "t001", "title": "one", "group": "20260925-beta"},
+        ])
+        self.assertNotEqual(first["text"], second["text"])
+        self.assertIn("alpha", first["text"])
+        self.assertIn("beta", second["text"])
+
+    def test_the_group_never_pushes_the_name_out(self):
+        # a long id fills the line, so the group gives way instead of clipping it
+        with_group, without = (self.render([{"id": "20260924-task-graph:t001", "title": "one", **extra}])[0]
+                               for extra in ({"group": "20260924-task-graph"}, {}))
+        self.assertEqual(with_group["text"].split("|")[1].rstrip()[:25], without["text"].split("|")[1].rstrip()[:25])
+        self.assertIn("20260924-task-graph:", with_group["text"])
+
+    def test_without_a_group_nothing_is_added(self):
+        [box] = self.render([{"id": "a", "label": "t001", "title": "one"}])
+        self.assertNotIn("·", box["text"])
+
+    def test_group_is_display_only(self):
+        config = {"title": "t", "tasks": [
+            {"id": "a", "title": "a", "group": "same"},
+            {"id": "b", "title": "b", "group": "same", "depends_on": ["a"]},
+        ]}
+        self.assertEqual(task_graph.load_config(self.write(config))["tasks"][1]["depends_on"], ["a"])
+
+    def test_non_string_group_is_rejected_at_load(self):
+        for bad in (5, ["x"], {"a": 1}, True, None):
+            with self.subTest(group=bad):
+                config = {"title": "t", "tasks": [{"id": "a", "group": bad, "depends_on": []}]}
+                with self.assertRaisesRegex(ValueError, "group must be a string: a"):
                     task_graph.load_config(self.write(config))
 
     def write(self, config):
