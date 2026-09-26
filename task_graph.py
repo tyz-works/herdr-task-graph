@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import unicodedata
+from typing import NamedTuple
 
 
 VALID_MANUAL_STATES = {"done", "running", "blocked", "ready", "waiting", "failed"}
@@ -82,6 +83,11 @@ def clip(text: str, width: int) -> str:
     return "".join(result)
 
 
+def clip_tail(text: str, width: int) -> str:
+    """The last `width` cells of `text`; the distinguishing part of a slug is usually its end."""
+    return clip(text[::-1], width)[::-1] if width > 0 else ""
+
+
 def fit(text: str, width: int, align: str = "left") -> str:
     text = clip(text, width)
     padding = max(0, width - cell_width(text))
@@ -134,6 +140,21 @@ class Canvas:
         for y in range(max(0, min(y1, y2)), min(self.height, max(y1, y2) + 1)):
             self.put(x, y, char, "line")
 
+    def blit(self, source: "Canvas", source_y: int, y: int, rows: int, x: int = 0) -> None:
+        """Copy `rows` rows of `source` starting at source_y into this canvas at y, from column x on."""
+        for offset in range(rows):
+            src_row, dst_row = source_y + offset, y + offset
+            if 0 <= src_row < source.height and 0 <= dst_row < self.height:
+                end = min(self.width, source.width)
+                self.cells[dst_row][x:end] = source.cells[src_row][x:end]
+                self.styles[dst_row][x:end] = source.styles[src_row][x:end]
+
+    def clear(self, x: int, y: int, width: int, rows: int) -> None:
+        for row in range(max(0, y), min(self.height, y + rows)):
+            for col in range(max(0, x), min(self.width, x + width)):
+                self.cells[row][col] = " "
+                self.styles[row][col] = "normal"
+
     def plain_lines(self) -> list[str]:
         return ["".join(row).rstrip() for row in self.cells]
 
@@ -155,6 +176,10 @@ def load_config(path: Path) -> dict:
         task.setdefault("depends_on", [])
         if not isinstance(task["depends_on"], list):
             raise ValueError(f"depends_on must be an array: {task_id}")
+        if "label" in task and not isinstance(task["label"], str):
+            raise ValueError(f"label must be a string: {task_id}")
+        if "group" in task and not isinstance(task["group"], str):
+            raise ValueError(f"group must be a string: {task_id}")
         status = task.get("status")
         if status is not None and status not in VALID_MANUAL_STATES:
             raise ValueError(f"invalid status for {task_id}: {status}")
@@ -254,6 +279,9 @@ class DashboardModel:
         # every snapshot) so a bad tasks.json stays visible until it is fixed.
         self.config_error = ""
         self.config_signature: tuple | None = None
+        # First graph row (in graph coordinates) shown on screen. Kept here so
+        # scrolling is stable while the selection moves inside the viewport.
+        self.view_top = 0
         self.compatibility = "unknown"
         self.compatibility_message = "compatibility not checked"
 
@@ -380,6 +408,87 @@ def state_style(state: str) -> str:
     }.get(state, "normal")
 
 
+MIN_BOX_WIDTH = 28
+MAX_BOX_WIDTH = 48  # boxes grow into spare width up to this, so titles have room
+BOX_HEIGHT = 5  # border, "[STATE] label", title, meta, border
+GROUP_WIDTH = 12  # cells of a task's group shown at the right end of the first line
+BOX_GAP = 3  # blank columns between boxes in a row
+ROW_GAP = 1  # blank rows between the rows of a wrapped level
+LEVEL_GAP = 4  # rows between levels; the connectors run through them
+DIVIDER_ROWS = 2  # rule that introduces a wrapped level, plus the row the arrows land on
+VIEW_TOP = 5  # first screen row of the graph; the row above holds "↑ N more"
+VIEW_RESERVED_ROWS = 9  # screen rows that are not graph: header (5), "↓ N more" and 3 footer rows
+
+
+def task_name(task: dict) -> str:
+    """What a box calls the task: its label if it has one, otherwise its id."""
+    return task.get("label") or task["id"]
+
+
+def box_width_for(graph_width: int) -> int:
+    """Box width for a graph area: as many MIN_BOX_WIDTH columns as fit, widened to use the spare width."""
+    if graph_width < 64:
+        return max(18, graph_width - 2)
+    columns = (graph_width + BOX_GAP) // (MIN_BOX_WIDTH + BOX_GAP)
+    return min(MAX_BOX_WIDTH, (graph_width + BOX_GAP) // columns - BOX_GAP)
+
+
+def box_header(task: dict, marker: str, state: str, name: str, inner: int) -> str:
+    """First box line: marker, state and name, with the tail of the task's group flush right.
+
+    The group only takes the room the name leaves over; it never clips the name.
+    """
+    left = clip(f"{marker} [{STATE_LABEL[state]}] {name}", inner)
+    group = task.get("group") or ""
+    room = min(GROUP_WIDTH, inner - cell_width(left) - 5)  # 5: " · " before and " " after
+    if not group or room < 3:
+        return fit(left, inner)
+    tail = group if cell_width(group) <= room else "…" + clip_tail(group, room - 1)
+    right = f" · {tail} "
+    return fit(left, inner - cell_width(right)) + right
+
+
+class GraphLayout(NamedTuple):
+    positions: dict[str, tuple[int, int]]  # task id -> (x, y); y counts from the graph top
+    rows: dict[str, tuple[int, int]]  # task id -> (row within its level, rows in its level)
+    dividers: list[tuple[int, int, int, int]]  # (y, level_index, task_count, rows) of wrapped levels
+    height: int
+
+
+def layout_graph(levels: list[list[dict]], graph_x: int, graph_width: int, box_width: int) -> GraphLayout:
+    """Place every box.
+
+    A level that does not fit on one line wraps into several rows of boxes on
+    the same column grid, so boxes never overlap whatever the width. Wrapped
+    levels get a divider rule above them.
+    """
+    columns = max(1, (graph_width + BOX_GAP) // (box_width + BOX_GAP))
+    positions: dict[str, tuple[int, int]] = {}
+    row_of: dict[str, tuple[int, int]] = {}
+    dividers: list[tuple[int, int, int, int]] = []
+    y = 0
+    bottom = 0
+    for level_index, level in enumerate(levels):
+        count = len(level)
+        rows = -(-count // columns)
+        if rows > 1:
+            dividers.append((y, level_index, count, rows))
+            y += DIVIDER_ROWS
+        used = min(count, columns)
+        required = used * box_width + (used - 1) * BOX_GAP
+        start_x = graph_x + max(0, (graph_width - required) // 2)
+        for index, task in enumerate(level):
+            row, column = divmod(index, columns)
+            positions[task["id"]] = (
+                start_x + column * (box_width + BOX_GAP),
+                y + row * (BOX_HEIGHT + ROW_GAP),
+            )
+            row_of[task["id"]] = (row, rows)
+        bottom = y + rows * BOX_HEIGHT + (rows - 1) * ROW_GAP
+        y = bottom + LEVEL_GAP
+    return GraphLayout(positions, row_of, dividers, bottom)
+
+
 def render_dashboard(model: DashboardModel, width: int, height: int, selected: int = 0) -> Canvas:
     canvas = Canvas(width, height)
     with model.lock:
@@ -428,70 +537,97 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
     )
     canvas.put(compat_x, 3, clip(compatibility_message, max(0, width - compat_x - 1)), compat_style)
 
-    box_width = 28 if graph_width >= 64 else max(18, graph_width - 2)
-    box_height = 4
-    level_step = 8
-    start_y = 5
-    positions: dict[str, tuple[int, int]] = {}
-    for level_index, level in enumerate(levels):
-        count = len(level)
-        required = count * box_width + max(0, count - 1) * 3
-        if required <= graph_width:
-            gap = 3
-            start_x = graph_x + max(0, (graph_width - required) // 2)
-            xs = [start_x + index * (box_width + gap) for index in range(count)]
-        else:
-            available = max(1, graph_width - box_width)
-            xs = [graph_x + (available * index // max(1, count - 1)) for index in range(count)]
-        y = start_y + level_index * level_step
-        for task, x in zip(level, xs):
-            positions[task["id"]] = (x, y)
+    box_width = box_width_for(graph_width)
+    layout = layout_graph(levels, graph_x, graph_width, box_width)
+    positions, graph_height = layout.positions, layout.height
+    names = {task["id"]: task_name(task) for task in tasks}
 
-    # Edges first so boxes remain readable when connectors overlap.
+    # The graph is drawn in full on its own canvas, and the part around the
+    # selection is copied to the screen, so edges and boxes scroll together.
+    graph = Canvas(width, graph_height)
     for task in tasks:
-        child = positions.get(task["id"])
-        if not child:
-            continue
+        child = positions[task["id"]]
         child_center = child[0] + box_width // 2
+        child_row = layout.rows[task["id"]][0]
         for dependency in task.get("depends_on", []):
-            parent = positions.get(dependency)
-            if not parent:
+            # Inside a wrapped level a connector would run past the boxes
+            # stacked below or above its owner and read as a dependency on
+            # them, so only connectors that start under the last row and end
+            # above the first row are drawn. `waiting:` still names the rest.
+            parent_row, parent_rows = layout.rows[dependency]
+            if parent_row != parent_rows - 1 or child_row != 0:
                 continue
+            parent = positions[dependency]
             parent_center = parent[0] + box_width // 2
-            start_edge_y = parent[1] + box_height
+            start_edge_y = parent[1] + BOX_HEIGHT
             end_edge_y = child[1] - 1
             mid_y = start_edge_y + max(0, (end_edge_y - start_edge_y) // 2)
-            canvas.vline(parent_center, start_edge_y, mid_y, "|")
-            canvas.hline(parent_center, child_center, mid_y, "-")
-            canvas.put(parent_center, mid_y, "+", "line")
-            canvas.put(child_center, mid_y, "+", "line")
-            canvas.vline(child_center, mid_y, end_edge_y, "|")
-            canvas.put(child_center, end_edge_y, "v", "line")
+            graph.vline(parent_center, start_edge_y, mid_y, "|")
+            graph.hline(parent_center, child_center, mid_y, "-")
+            graph.put(parent_center, mid_y, "+", "line")
+            graph.put(child_center, mid_y, "+", "line")
+            graph.vline(child_center, mid_y, end_edge_y, "|")
+            graph.put(child_center, end_edge_y, "v", "line")
+
+    for y, level_index, count, rows in layout.dividers:
+        rule = f"-- level {level_index + 1} · {count} tasks · {rows} rows "
+        graph.put(graph_x, y, rule, "muted")
+        graph.hline(graph_x + cell_width(rule), graph_x + graph_width - 1, y, "-")
 
     for task in tasks:
         task_id = task["id"]
         x, y = positions[task_id]
-        if y + box_height >= height - 3:
-            continue
         state = states[task_id]
         style = state_style(state)
-        canvas.put(x, y, "+" + "-" * (box_width - 2) + "+", style)
+        graph.put(x, y, "+" + "-" * (box_width - 2) + "+", style)
         marker = ">" if task_id == selected_id else " "
-        label = f"{marker} [{STATE_LABEL[state]}] {task_id}  {task['title']}"
-        canvas.put(x, y + 1, "|" + fit(label, box_width - 2) + "|", style)
+        inner = box_width - 2
+        graph.put(x, y + 1, "|" + box_header(task, marker, state, names[task_id], inner) + "|", style)
+        graph.put(x, y + 2, "|" + fit("  " + str(task["title"]), inner) + "|", style)
         agent = matches.get(task_id)
         if agent:
             meta = f"{agent_name(agent)} · {agent.get('agent_status', 'unknown')}"
         elif task.get("depends_on") and state == "waiting":
-            pending = [dep for dep in task["depends_on"] if states.get(dep) != "done"]
+            pending = [names[dep] for dep in task["depends_on"] if states.get(dep) != "done"]
             meta = "waiting: " + ", ".join(pending)
         elif state == "ready":
             ready_count = sum(value == "ready" for value in states.values())
             meta = "ready · parallel" if ready_count > 1 else "ready"
         else:
             meta = ""
-        canvas.put(x, y + 2, "|" + fit(meta, box_width - 2, "center") + "|", style)
-        canvas.put(x, y + 3, "+" + "-" * (box_width - 2) + "+", style)
+        graph.put(x, y + 3, "|" + fit(meta, inner, "center") + "|", style)
+        graph.put(x, y + 4, "+" + "-" * (box_width - 2) + "+", style)
+
+    view_height = max(0, height - VIEW_RESERVED_ROWS)
+    with model.lock:
+        top = model.view_top
+        if selected_id in positions:
+            selected_y = positions[selected_id][1]
+            need_top, need_end = max(0, selected_y - 2), selected_y + BOX_HEIGHT
+            if top + view_height < need_end:
+                top = need_end - view_height
+            if top > need_top:
+                top = need_top
+        top = max(0, min(top, graph_height - view_height))
+        model.view_top = top
+    canvas.blit(graph, top, VIEW_TOP, view_height, graph_x)
+    # A box cut by the top or bottom edge would be missing a border, so it is
+    # blanked out and counted as hidden along with the boxes fully off screen.
+    above = below = 0
+    for x, y in positions.values():
+        if y < top:
+            above += 1
+        elif y + BOX_HEIGHT > top + view_height:
+            below += 1
+        else:
+            continue
+        first = max(VIEW_TOP, VIEW_TOP + y - top)
+        last = min(VIEW_TOP + view_height, VIEW_TOP + y - top + BOX_HEIGHT)
+        canvas.clear(x, first, box_width, last - first)
+    if above:
+        canvas.put(graph_x + 1, VIEW_TOP - 1, f"↑ {above} more", "yellow")
+    if below:
+        canvas.put(graph_x + 1, VIEW_TOP + view_height, f"↓ {below} more", "yellow")
 
     counts = {state: list(states.values()).count(state) for state in STATE_LABEL}
     summary = (
