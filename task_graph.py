@@ -189,6 +189,20 @@ def load_config(path: Path) -> dict:
             if dependency not in ids:
                 raise ValueError(f"{task['id']} depends on missing task {dependency}")
 
+    groups_field = data.get("groups")
+    if groups_field is not None:
+        if not isinstance(groups_field, list):
+            raise ValueError("groups must be an array")
+        seen_group_ids: set[str] = set()
+        for entry in groups_field:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
+                raise ValueError("every groups entry needs a non-empty string id")
+            if "title" in entry and not isinstance(entry["title"], str):
+                raise ValueError(f"groups title must be a string: {entry['id']}")
+            if entry["id"] in seen_group_ids:
+                raise ValueError(f"duplicate group id: {entry['id']}")
+            seen_group_ids.add(entry["id"])
+
     topological_levels(data["tasks"])
     data.setdefault("title", "Task graph")
     return data
@@ -489,7 +503,153 @@ def layout_graph(levels: list[list[dict]], graph_x: int, graph_width: int, box_w
     return GraphLayout(positions, row_of, dividers, bottom)
 
 
-def render_dashboard(model: DashboardModel, width: int, height: int, selected: int = 0) -> Canvas:
+ALL_PAGE: tuple = ("all",)
+NO_GROUP_PAGE: tuple = ("no_group",)
+TAB_ROW = 2  # directly under the "====" rule, blank before 0.4.0
+
+
+def effective_group(task: dict) -> str | None:
+    group = task.get("group")
+    return group or None
+
+
+class PageInfo(NamedTuple):
+    key: tuple
+    value: str | None  # raw group value; None for All / (no group)
+    title: str
+    count: int
+
+
+def compute_pages(tasks: list[dict], groups_field: list[dict] | None) -> list[PageInfo]:
+    """One page per distinct `group`, plus `All` first and `(no group)` for tasks without one.
+
+    Order and display names come from the top-level `groups` field when it is
+    present (any group value seen in the tasks but missing from `groups` is
+    appended after it, and `(no group)` goes last); otherwise pages follow the
+    order groups first appear in `tasks`, with `(no group)` sitting wherever
+    that first happens. A `groups` entry with no matching task gets no page.
+    """
+    counts: dict[str | None, int] = {}
+    first_seen: list[str | None] = []
+    for task in tasks:
+        group = effective_group(task)
+        counts[group] = counts.get(group, 0) + 1
+        if group not in first_seen:
+            first_seen.append(group)
+
+    # A task without a group only earns its own page when some other task in
+    # the file does have one; with no groups at all "(no group)" would just
+    # repeat "All", so backward compatibility (no `group` used anywhere) keeps
+    # a single All page.
+    has_named_group = any(group is not None for group in first_seen)
+
+    pages = [PageInfo(ALL_PAGE, None, "All", len(tasks))]
+    if groups_field:
+        order = [entry["id"] for entry in groups_field]
+        titles = {entry["id"]: entry.get("title") or entry["id"] for entry in groups_field}
+        for group in first_seen:
+            if group is not None and group not in order:
+                order.append(group)
+        for group in order:
+            count = counts.get(group, 0)
+            if count:
+                pages.append(PageInfo(("group", group), group, titles.get(group, group), count))
+        if has_named_group and counts.get(None):
+            pages.append(PageInfo(NO_GROUP_PAGE, None, "(no group)", counts[None]))
+    else:
+        for group in first_seen:
+            if group is None:
+                if has_named_group:
+                    pages.append(PageInfo(NO_GROUP_PAGE, None, "(no group)", counts[None]))
+            else:
+                pages.append(PageInfo(("group", group), group, group, counts[group]))
+    return pages
+
+
+def tasks_for_page(tasks: list[dict], page_key: tuple) -> list[dict]:
+    if page_key == ALL_PAGE:
+        return tasks
+    if page_key == NO_GROUP_PAGE:
+        return [task for task in tasks if effective_group(task) is None]
+    _, value = page_key
+    return [task for task in tasks if effective_group(task) == value]
+
+
+def page_topological_levels(page_tasks: list[dict]) -> list[list[dict]]:
+    """`topological_levels` restricted to the tasks on one page.
+
+    A dependency on a task outside the page cannot be resolved on this page,
+    so it is dropped from this local copy (never from the task's real
+    `depends_on`) and the task becomes a root of the page's graph instead of
+    raising a missing-dependency error. `task_states` still evaluates the
+    real, whole-graph dependency; only this layout is scoped to the page.
+    """
+    page_ids = {task["id"] for task in page_tasks}
+    local_tasks = []
+    for task in page_tasks:
+        local = dict(task)
+        local["depends_on"] = [dep for dep in task.get("depends_on", []) if dep in page_ids]
+        local_tasks.append(local)
+    return topological_levels(local_tasks)
+
+
+def resolve_page(value: str | None, pages: list[PageInfo]) -> tuple:
+    if not value or value.lower() == "all":
+        return ALL_PAGE
+    for page in pages:
+        if page.value == value:
+            return page.key
+    return ALL_PAGE
+
+
+def adjacent_page(pages: list[PageInfo], current: tuple, step: int) -> tuple:
+    keys = [page.key for page in pages]
+    index = keys.index(current) if current in keys else 0
+    return keys[(index + step) % len(keys)]
+
+
+def draw_tabs(canvas: Canvas, pages: list[PageInfo], current: tuple, width: int) -> None:
+    """Tab bar: `Title(count)` per page, current one bracketed, trimmed around it with `…`."""
+    keys = [page.key for page in pages]
+    current_index = keys.index(current) if current in keys else 0
+    labels = [f"{page.title}({page.count})" for page in pages]
+    labels[current_index] = f"[{labels[current_index]}]"
+    available = max(0, width - 2)
+    sep = " | "
+    included = [current_index]
+    total = cell_width(labels[current_index])
+    left, right = current_index - 1, current_index + 1
+    while True:
+        grew = False
+        if right < len(labels) and total + cell_width(sep) + cell_width(labels[right]) <= available:
+            included.append(right)
+            total += cell_width(sep) + cell_width(labels[right])
+            right += 1
+            grew = True
+        if left >= 0 and total + cell_width(sep) + cell_width(labels[left]) <= available:
+            included.insert(0, left)
+            total += cell_width(sep) + cell_width(labels[left])
+            left -= 1
+            grew = True
+        if not grew:
+            break
+    x = 1
+    if included[0] > 0:
+        canvas.put(x, TAB_ROW, "… ", "muted")
+        x += cell_width("… ")
+    for position, index in enumerate(included):
+        if position:
+            canvas.put(x, TAB_ROW, sep, "muted")
+            x += cell_width(sep)
+        canvas.put(x, TAB_ROW, labels[index], "header" if index == current_index else "muted")
+        x += cell_width(labels[index])
+    if included[-1] < len(labels) - 1:
+        canvas.put(x, TAB_ROW, " …", "muted")
+
+
+def render_dashboard(
+    model: DashboardModel, width: int, height: int, selected: int = 0, page: tuple = ALL_PAGE
+) -> Canvas:
     canvas = Canvas(width, height)
     with model.lock:
         config = model.config
@@ -498,16 +658,23 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
         error = model.config_error or model.error
         compatibility = model.compatibility
         compatibility_message = model.compatibility_message
-    tasks = config["tasks"]
-    levels = topological_levels(tasks)
+    all_tasks = config["tasks"]
     states, matches = model.task_states()
-    selected = max(0, min(selected, len(tasks) - 1))
+    pages = compute_pages(all_tasks, config.get("groups"))
+    page_keys = {info.key for info in pages}
+    if page not in page_keys:
+        page = ALL_PAGE
+    tasks = tasks_for_page(all_tasks, page)
+    page_ids = {task["id"] for task in tasks}
+    names = {task["id"]: task_name(task) for task in all_tasks}
+    selected = max(0, min(selected, len(tasks) - 1)) if tasks else 0
     selected_id = tasks[selected]["id"] if tasks else None
 
     canvas.put(1, 0, "HERDR  //  TASK GRAPH", "header")
     title = str(config.get("title", "Task graph"))
     canvas.put(max(24, width - cell_width(title) - 2), 0, title, "header")
     canvas.hline(0, width - 1, 1, "=")
+    draw_tabs(canvas, pages, page, width)
 
     # Herdr already has its own outer sidebar. Repeat the agent list only when
     # the plugin pane is wide enough to keep three parallel DAG nodes apart.
@@ -515,7 +682,7 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
     side_width = min(30, max(24, width // 4)) if show_sidebar else 0
     if show_sidebar:
         canvas.put(2, 3, "AGENTS", "header")
-        canvas.vline(side_width, 2, height - 3, "|")
+        canvas.vline(side_width, TAB_ROW + 1, height - 3, "|")
         y = 5
         max_agents = max(0, (height - 9) // 2)
         for agent in agents[:max_agents]:
@@ -538,9 +705,9 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
     canvas.put(compat_x, 3, clip(compatibility_message, max(0, width - compat_x - 1)), compat_style)
 
     box_width = box_width_for(graph_width)
+    levels = page_topological_levels(tasks)
     layout = layout_graph(levels, graph_x, graph_width, box_width)
     positions, graph_height = layout.positions, layout.height
-    names = {task["id"]: task_name(task) for task in tasks}
 
     # The graph is drawn in full on its own canvas, and the part around the
     # selection is copied to the screen, so edges and boxes scroll together.
@@ -550,6 +717,8 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
         child_center = child[0] + box_width // 2
         child_row = layout.rows[task["id"]][0]
         for dependency in task.get("depends_on", []):
+            if dependency not in positions:
+                continue  # depends on a task on another page; not drawn here
             # Inside a wrapped level a connector would run past the boxes
             # stacked below or above its owner and read as a dependency on
             # them, so only connectors that start under the last row and end
@@ -588,7 +757,14 @@ def render_dashboard(model: DashboardModel, width: int, height: int, selected: i
         if agent:
             meta = f"{agent_name(agent)} · {agent.get('agent_status', 'unknown')}"
         elif task.get("depends_on") and state == "waiting":
-            pending = [names[dep] for dep in task["depends_on"] if states.get(dep) != "done"]
+            pending = []
+            for dep in task["depends_on"]:
+                if states.get(dep) == "done":
+                    continue
+                label = names.get(dep, dep)
+                if dep not in page_ids:
+                    label = f"{label} (other page)"
+                pending.append(label)
             meta = "waiting: " + ", ".join(pending)
         elif state == "ready":
             ready_count = sum(value == "ready" for value in states.values())
@@ -851,32 +1027,53 @@ def paint(stdscr, canvas: Canvas, attrs: dict[str, int]) -> None:
     stdscr.refresh()
 
 
-def run_tui(stdscr, model: DashboardModel, config_path: Path) -> None:
+def run_tui(stdscr, model: DashboardModel, config_path: Path, initial_page: tuple = ALL_PAGE) -> None:
     curses.curs_set(0)
     stdscr.keypad(True)
     stdscr.timeout(250)
     attrs = init_colors()
+    page = initial_page
+    page_selection: dict[tuple, str] = {}
     selected = 0
     while True:
         poll_config(model, config_path)
-        selected = max(0, min(selected, len(model.config["tasks"]) - 1))
-        height, width = stdscr.getmaxyx()
-        paint(stdscr, render_dashboard(model, width, height, selected), attrs)
-        key = stdscr.getch()
         tasks = model.config["tasks"]
+        pages = compute_pages(tasks, model.config.get("groups"))
+        if page not in {info.key for info in pages}:
+            page = ALL_PAGE
+        page_tasks = tasks_for_page(tasks, page)
+        if page_tasks:
+            remembered = page_selection.get(page)
+            ids = [task["id"] for task in page_tasks]
+            selected = ids.index(remembered) if remembered in ids else 0
+        else:
+            selected = 0
+        height, width = stdscr.getmaxyx()
+        paint(stdscr, render_dashboard(model, width, height, selected, page), attrs)
+        key = stdscr.getch()
         if key in (ord("q"), 27):
             return
-        if key in (ord("j"), curses.KEY_DOWN) and tasks:
-            selected = (selected + 1) % len(tasks)
-        elif key in (ord("k"), curses.KEY_UP) and tasks:
-            selected = (selected - 1) % len(tasks)
-        elif key in (10, 13, curses.KEY_ENTER) and tasks:
-            task = tasks[selected]
+        if key in (ord("j"), curses.KEY_DOWN) and page_tasks:
+            selected = (selected + 1) % len(page_tasks)
+            page_selection[page] = page_tasks[selected]["id"]
+        elif key in (ord("k"), curses.KEY_UP) and page_tasks:
+            selected = (selected - 1) % len(page_tasks)
+            page_selection[page] = page_tasks[selected]["id"]
+        elif key in (10, 13, curses.KEY_ENTER) and page_tasks:
+            task = page_tasks[selected]
             agent = model.match_agent(task)
             if agent and agent.get("pane_id"):
                 focus_pane(agent["pane_id"])
         elif key == ord("r"):
             reload_config(model, config_path)
+        elif key in (ord("\t"), ord("]")):
+            page = adjacent_page(pages, page, 1)
+        elif key in (curses.KEY_BTAB, ord("[")):
+            page = adjacent_page(pages, page, -1)
+        elif ord("0") <= key <= ord("9"):
+            index = key - ord("0")
+            if index < len(pages):
+                page = pages[index].key
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -887,6 +1084,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--once", action="store_true", help="print one frame and exit")
     parser.add_argument("--width", type=int, default=120, help="width used by --once")
     parser.add_argument("--height", type=int, default=36, help="height used by --once")
+    parser.add_argument("--page", help="initial page: a group value, or 'all' (default)")
     return parser.parse_args(argv)
 
 
@@ -915,15 +1113,17 @@ def main(argv: list[str] | None = None) -> int:
             model.set_compatibility("demo", MAX_VERIFIED_PROTOCOL)
             model.set_agents(demo_agents())
 
+    initial_page = resolve_page(args.page, compute_pages(model.config["tasks"], model.config.get("groups")))
+
     exit_code = 0
     if args.once:
-        print("\n".join(render_dashboard(model, args.width, args.height).plain_lines()))
+        print("\n".join(render_dashboard(model, args.width, args.height, page=initial_page).plain_lines()))
         exit_code = 1 if model.config_error else 0
     elif not sys.stdin.isatty() or not sys.stdout.isatty():
         print("Interactive mode requires a TTY. Use --once for a static preview.", file=sys.stderr)
         return 2
     else:
-        curses.wrapper(run_tui, model, config_path)
+        curses.wrapper(run_tui, model, config_path, initial_page)
 
     if subscriber:
         subscriber.stop()

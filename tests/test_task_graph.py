@@ -250,6 +250,22 @@ def drive_tui(model, config_path, steps):
         task_graph.run_tui(FakeScreen(steps), model, config_path)
 
 
+def drive_tui_capture(model, config_path, steps, initial_page=None):
+    """Like drive_tui, but returns the plain_lines() of every frame painted."""
+    if initial_page is None:
+        initial_page = task_graph.ALL_PAGE
+    frames = []
+
+    def capture(stdscr, canvas, attrs):
+        frames.append(canvas.plain_lines())
+
+    with mock.patch.object(task_graph.curses, "curs_set"), \
+            mock.patch.object(task_graph, "init_colors", return_value={}), \
+            mock.patch.object(task_graph, "paint", side_effect=capture):
+        task_graph.run_tui(FakeScreen(steps), model, config_path, initial_page)
+    return frames
+
+
 def frame(model):
     return "\n".join(task_graph.render_dashboard(model, 120, 36).plain_lines())
 
@@ -853,6 +869,218 @@ class GroupTests(unittest.TestCase):
         path = tmp / "tasks.json"
         path.write_text(json.dumps(config), encoding="utf-8")
         return path
+
+
+class PageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="hg"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = self.tmp / "tasks.json"
+
+    def write(self, config):
+        self.path.write_text(json.dumps(config), encoding="utf-8")
+        return self.path
+
+    def replace(self, config):
+        tmp = Path(str(self.path) + ".tmp")
+        tmp.write_text(json.dumps(config), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def two_group_config(self):
+        return {
+            "title": "t",
+            "tasks": [
+                {"id": "a1", "title": "A one", "group": "alpha", "depends_on": []},
+                {"id": "a2", "title": "A two", "group": "alpha", "depends_on": []},
+                {"id": "b1", "title": "B one", "group": "beta", "depends_on": []},
+            ],
+        }
+
+    # (a) a page shows only its own group's boxes
+    def test_group_page_shows_only_that_groups_boxes(self):
+        config = crewvia_like_config(groups=True)
+        model = task_graph.DashboardModel(config)
+        pages = task_graph.compute_pages(config["tasks"], None)
+        group_a = next(p for p in pages if p.value == "20260924-task-graph")
+        group_b_ids = {t["id"] for t in config["tasks"] if t["group"] == "20260925-task-graph-usable"}
+        for width in (80, 120, 200):
+            with self.subTest(width=width):
+                lines = task_graph.render_dashboard(model, width, 60, 0, group_a.key).plain_lines()
+                boxes = drawn_boxes(lines)
+                self.assertGreaterEqual(len(boxes), 4, boxes)
+                shown_ids = {box["name"] for box in boxes}
+                self.assertFalse(shown_ids & group_b_ids, shown_ids & group_b_ids)
+
+    # (b) a dependency outside the page becomes a root instead of an exception,
+    # and the waiting line marks it as external
+    def test_dependency_outside_page_becomes_a_root_with_external_waiting_label(self):
+        config = {
+            "title": "t",
+            "tasks": [
+                {"id": "a1", "title": "one", "group": "alpha", "depends_on": []},
+                {"id": "b1", "title": "two", "group": "beta", "depends_on": ["a1"]},
+            ],
+        }
+        model = task_graph.DashboardModel(config)
+        pages = task_graph.compute_pages(config["tasks"], None)
+        beta = next(p for p in pages if p.value == "beta")
+        lines = task_graph.render_dashboard(model, 120, 36, 0, beta.key).plain_lines()
+        boxes = drawn_boxes(lines)
+        self.assertEqual([box["name"] for box in boxes], ["b1"])
+        self.assertTrue(boxes[0]["intact"])
+        self.assertIn("waiting: a1 (other page)", "\n".join(lines))
+
+    # (c) Tab / ] / [ / digit keys switch pages and wrap at the ends
+    def test_tab_switch_keys_cycle_and_wrap(self):
+        config = self.two_group_config()
+        self.write(config)
+        model = task_graph.DashboardModel(task_graph.load_config(self.path))
+        pages = task_graph.compute_pages(config["tasks"], None)
+        all_page, alpha, beta = pages
+        frames = drive_tui_capture(model, self.path, [ord("\t"), ord("]"), ord("["), ord("0")])
+        self.assertIn(f"[{all_page.title}({all_page.count})]", "\n".join(frames[0]))
+        self.assertIn(f"[{alpha.title}({alpha.count})]", "\n".join(frames[1]))
+        self.assertIn(f"[{beta.title}({beta.count})]", "\n".join(frames[2]))
+        self.assertIn(f"[{alpha.title}({alpha.count})]", "\n".join(frames[3]))
+        self.assertIn(f"[{all_page.title}({all_page.count})]", "\n".join(frames[4]))
+
+    def test_prev_from_all_wraps_to_the_last_page(self):
+        config = self.two_group_config()
+        self.write(config)
+        model = task_graph.DashboardModel(task_graph.load_config(self.path))
+        pages = task_graph.compute_pages(config["tasks"], None)
+        frames = drive_tui_capture(model, self.path, [ord("[")])
+        self.assertIn(f"[{pages[-1].title}({pages[-1].count})]", "\n".join(frames[1]))
+
+    def test_digit_zero_selects_all(self):
+        config = self.two_group_config()
+        self.write(config)
+        model = task_graph.DashboardModel(task_graph.load_config(self.path))
+        pages = task_graph.compute_pages(config["tasks"], None)
+        frames = drive_tui_capture(model, self.path, [ord("\t"), ord("0")])
+        self.assertIn(f"[{pages[0].title}({pages[0].count})]", "\n".join(frames[2]))
+
+    # (d) auto-reload: stay on the current page while its group survives,
+    # revert to All when it disappears, reset selection when it disappears
+    def test_reload_keeps_the_current_page_when_its_group_still_exists(self):
+        config = self.two_group_config()
+        self.write(config)
+        model = task_graph.DashboardModel(task_graph.load_config(self.path))
+
+        def grow_alpha():
+            grown = self.two_group_config()
+            grown["tasks"].append({"id": "a3", "title": "A three", "group": "alpha", "depends_on": []})
+            self.replace(grown)
+
+        frames = drive_tui_capture(model, self.path, [ord("\t"), grow_alpha, -1])
+        self.assertIn("alpha(3)", "\n".join(frames[2]))
+        self.assertTrue(any(box["name"] == "a3" for box in drawn_boxes(frames[2])))
+
+    def test_reload_reverts_to_all_when_the_current_group_disappears(self):
+        config = self.two_group_config()
+        self.write(config)
+        model = task_graph.DashboardModel(task_graph.load_config(self.path))
+
+        def drop_alpha():
+            shrunk = {"title": "t", "tasks": [t for t in self.two_group_config()["tasks"] if t["group"] != "alpha"]}
+            self.replace(shrunk)
+
+        frames = drive_tui_capture(model, self.path, [ord("\t"), drop_alpha, -1])
+        text = "\n".join(frames[2])
+        self.assertRegex(text, r"\[All\(\d+\)\]")
+        self.assertNotIn("alpha", text)
+
+    def test_selection_resets_to_first_when_the_selected_task_disappears(self):
+        config = self.two_group_config()
+        self.write(config)
+        model = task_graph.DashboardModel(task_graph.load_config(self.path))
+
+        def drop_a1():
+            shrunk = self.two_group_config()
+            shrunk["tasks"] = [t for t in shrunk["tasks"] if t["id"] != "a1"]
+            self.replace(shrunk)
+
+        frames = drive_tui_capture(model, self.path, [ord("\t"), ord("j"), drop_a1, -1])
+        selected_box = next(box for box in drawn_boxes(frames[3]) if box["selected"])
+        self.assertEqual(selected_box["name"], "a2")
+
+    # (e) the `groups` field controls order and display names; malformed
+    # `groups` is rejected at load, like `label`/`group` already are
+    def test_groups_field_controls_order_and_titles(self):
+        config = {
+            "title": "t",
+            "groups": [{"id": "beta", "title": "Beta Team"}, {"id": "alpha", "title": "Alpha Team"}],
+            "tasks": [
+                {"id": "a1", "title": "one", "group": "alpha", "depends_on": []},
+                {"id": "b1", "title": "two", "group": "beta", "depends_on": []},
+            ],
+        }
+        pages = task_graph.compute_pages(config["tasks"], config["groups"])
+        self.assertEqual([page.title for page in pages], ["All", "Beta Team", "Alpha Team"])
+        model = task_graph.DashboardModel(config)
+        text = "\n".join(task_graph.render_dashboard(model, 120, 36).plain_lines())
+        self.assertIn("Beta Team(1)", text)
+        self.assertIn("Alpha Team(1)", text)
+
+    def test_invalid_groups_field_is_rejected_at_load(self):
+        cases = [
+            {"groups": "not-a-list"},
+            {"groups": [{"title": "no id"}]},
+            {"groups": [{"id": 5}]},
+            {"groups": [{"id": "a", "title": 5}]},
+            {"groups": [{"id": "dup"}, {"id": "dup"}]},
+        ]
+        for extra in cases:
+            with self.subTest(extra=extra):
+                config = {"title": "t", "tasks": [{"id": "x", "depends_on": []}], **extra}
+                with self.assertRaises(ValueError):
+                    task_graph.load_config(self.write(config))
+
+    def test_tab_row_is_not_corrupted_by_the_agent_sidebar_divider(self):
+        # The sidebar's vertical rule used to start on the same row as the
+        # tab bar and draw a stray "|" through a label there (e.g. turning
+        # "mechanize-b" into "mecha|ize-b") at widths >= 128.
+        config = crewvia_like_config(groups=True)
+        model = task_graph.DashboardModel(config)
+        model.set_agents(task_graph.demo_agents())
+        pages = task_graph.compute_pages(config["tasks"], None)
+        current = pages[1]
+        lines = task_graph.render_dashboard(model, 200, 36, 0, current.key).plain_lines()
+        self.assertIn(f"[{current.title}({current.count})]", lines[task_graph.TAB_ROW])
+
+    # (f) extreme widths and a very small terminal never raise
+    def test_extreme_dimensions_do_not_raise(self):
+        config = crewvia_like_config(groups=True)
+        model = task_graph.DashboardModel(config)
+        pages = task_graph.compute_pages(config["tasks"], None)
+        for width, height in ((80, 36), (120, 36), (200, 36), (20, 6)):
+            for page in pages:
+                with self.subTest(width=width, height=height, page=page.title):
+                    task_graph.render_dashboard(model, width, height, 0, page.key)
+
+    # (8) backward compatibility: no `groups` and/or no `group` still works
+    def test_backward_compat_no_group_field_is_all_only(self):
+        model = task_graph.DashboardModel(task_graph.load_config(ROOT / "tasks.json"))
+        pages = task_graph.compute_pages(model.config["tasks"], model.config.get("groups"))
+        self.assertEqual([page.title for page in pages], ["All"])
+
+    def test_mixed_group_and_no_group_tasks_add_a_no_group_page(self):
+        config = {"title": "t", "tasks": [
+            {"id": "a1", "title": "one", "group": "alpha", "depends_on": []},
+            {"id": "x1", "title": "two", "depends_on": []},
+        ]}
+        pages = task_graph.compute_pages(config["tasks"], None)
+        self.assertEqual([page.title for page in pages], ["All", "alpha", "(no group)"])
+
+    # (7) --page picks the initial page for --once
+    def test_cli_page_option_selects_the_initial_page_with_once(self):
+        self.write(self.two_group_config())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            task_graph.main(["--demo", "--once", "--config", str(self.path), "--page", "alpha"])
+        text = out.getvalue()
+        self.assertIn("[alpha(2)]", text)
+        self.assertNotIn(" b1 ", text)
 
 
 if __name__ == "__main__":

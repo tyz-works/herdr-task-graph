@@ -31,6 +31,7 @@ A live terminal DAG for [Herdr](https://herdr.dev/) that shows task dependencies
 - Dependency-derived `READY` and `WAIT` states.
 - Parallel work is visible whenever several tasks are ready at once.
 - Large graphs stay readable: a level too wide for the pane wraps into several rows, and the view scrolls to keep the selected task on screen.
+- Tasks split into pages by `group`, switched with `Tab`/`]`/`[`/digits or `--page`.
 - Select a task and press Enter to focus its agent pane.
 - Responsive terminal layout with no third-party Python packages.
 - Offline demo and one-shot rendering modes.
@@ -133,6 +134,36 @@ Map a task to Herdr with either:
 
 An optional fixed `status` may be `done`, `running`, `blocked`, `ready`, `waiting`, or `failed`. Without it, status is derived from Herdr and the task dependencies.
 
+## Pages
+
+When tasks come from several projects (or, with crewvia, several missions), `group` also splits them into pages: `All` (everything, unchanged) plus one page per distinct `group` value, and a `(no group)` page when some tasks have a `group` and others don't. A tab bar under the header lists every page with its task count, e.g. `All(62) | minerva(31) | mechanize-b(31)`, the current page in `[brackets]`; when it doesn't fit, pages around the current one are kept and the rest is trimmed with `…`.
+
+An optional top-level `groups` array sets the page order and display names:
+
+```json
+{
+  "groups": [
+    {"id": "minerva", "title": "Minerva"},
+    {"id": "mechanize-b", "title": "Mechanize B"}
+  ],
+  "tasks": [...]
+}
+```
+
+Without `groups`, pages follow the order group values first appear in `tasks`, and the page title is the group value itself. A `groups` entry with no matching task gets no page. `tasks.json` with no `groups` field and no `group` on any task renders exactly as before (a single `All` page).
+
+READY/WAIT state and dependency resolution always consider every task, not just the current page; pages only change what is drawn and selectable. A task that depends on one on another page is drawn as a root of this page's graph, and its `waiting:` line marks that dependency `(other page)`.
+
+The selection is remembered per page: switching back to a page returns to the task last selected there (or the first task, the first time). Reloading `tasks.json` keeps the current page while its group still has tasks and returns to `All` when it doesn't; a selected task that disappears resets to the first task on its page.
+
+| Key | Action |
+| --- | --- |
+| `Tab`, `]` | Next page |
+| `Shift-Tab`, `[` | Previous page |
+| `0`-`9` | Jump to page N (`0` is `All`) |
+
+`--page <group value | all>` picks the starting page, including together with `--once` for a static preview of one page.
+
 Override the configuration path with `HERDR_TASKS_FILE` or `--config`. The first one that is set wins, then a `tasks.json` entry in the plugin config directory. The bundled sample is shown only when none of them is configured.
 
 The file is watched: saving it, replacing it (`os.replace`), or replacing the target of a symlink in the config directory updates the dashboard within a fraction of a second. If the file is missing, unreadable, or invalid, the dashboard keeps showing the last good tasks (or an empty graph at startup) and displays the error until the file is fixed. A configured file that cannot be read is never replaced by the sample.
@@ -152,6 +183,8 @@ Inside a wrapped level, connectors are drawn only where they cannot be misread: 
 | `j`, `Down` | Select next task (scrolls the view when needed) |
 | `k`, `Up` | Select previous task (scrolls the view when needed) |
 | `Enter` | Focus the selected task's agent pane |
+| `Tab`/`]`, `Shift-Tab`/`[` | Next / previous page (see [Pages](#pages)) |
+| `0`-`9` | Jump to page N (`0` is `All`) |
 | `r` | Reload `tasks.json` now (changes are also picked up automatically) |
 | `q`, `Esc` | Quit |
 
