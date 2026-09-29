@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## 0.4.0 - 2026-09-29
+
+- Split tasks into pages by their `group`: an `All` page (unchanged, everything) plus one page per distinct `group` value, and a `(no group)` page when some tasks have a group and others don't. A tab bar under the header (`All(62) | minerva(31) | mechanize-b(31)`, current page bracketed) shows every page with its task count. `Tab`/`Shift-Tab`, `]`/`[`, and the digits `0`-`9` (`0` = `All`) switch pages, wrapping at the ends. `--page <group value | all>` picks the starting page, including with `--once`.
+- An optional top-level `groups` array (`[{"id": ..., "title": ...}]`) sets the page order and display names; without it, pages follow the order groups first appear in `tasks`. A `groups` entry with no matching task gets no page, and a malformed `groups` (not an array, a missing/non-string `id`, a non-string `title`, or a duplicate `id`) is rejected when the file is loaded, like `label` and `group` already are.
+- READY/WAIT state and dependency resolution are computed over every task regardless of page; only the layout is scoped. A task whose dependency lives on another page is drawn as a root on this one, and its `waiting:` line marks that dependency `(other page)` instead of raising an error.
+- The selection is remembered per page (back to where you left it, first task on a page not visited yet). Auto-reload keeps the current page while its group still has tasks, and returns to `All` when it doesn't; a selected task that disappears resets to the first task on its page.
+- `tasks.json` without a `groups` field or without any `group` on its tasks renders exactly as before (`All` only, unless some tasks have a `group` and others don't, in which case `(no group)` also appears).
+
 ## 0.3.0 - 2026-09-26
 
 - Wrap a level that is wider than the pane into several rows instead of drawing its boxes on top of each other. A level of dozens of independent tasks (what crewvia produces at the start of a mission) is now readable at any width, and wrapped levels are introduced by a `-- level N · M tasks · R rows ---` rule.
