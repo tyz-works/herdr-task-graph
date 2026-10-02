@@ -132,7 +132,9 @@ Map a task to Herdr with either:
 - `pane_id`: an exact Herdr pane id.
 - `pane_match`: a substring matched against pane id, agent name, and pane title.
 
-An optional fixed `status` may be `done`, `running`, `blocked`, `ready`, `waiting`, or `failed`. Without it, status is derived from Herdr and the task dependencies.
+An optional fixed `status` may be `done`, `running`, `blocked`, `ready`, `waiting`, or `failed`. Without it, status is derived from Herdr and the task dependencies. Herdr's `idle`/`done` describes an **agent turn**, not a completed task: after a working turn ends the task shows `REVIEW`, and a resumed agent returns it to `RUN`. Only `status: "done"` in `tasks.json` completes a task and unlocks its dependents.
+
+Task and agent indicators use Herdr's semantic colors (working/RUN yellow, blocked red, done/idle green). The dashboard reads the configured built-in theme and `theme.custom` colors from `~/.config/herdr/config.toml` when Python 3.11+ and a 256-color terminal are available. `HERDR_TASK_GRAPH_THEME` overrides the theme name when the active theme differs from the config (for example, after an appearance auto-switch). RGB is mapped to the closest xterm-256 color; 16-color terminals use semantic ANSI colors.
 
 ## Pages
 
@@ -170,6 +172,8 @@ The file is watched: saving it, replacing it (`os.replace`), or replacing the ta
 
 ## Large graphs
 
+On a short (26 rows or fewer) or narrow (under 70 columns) pane, an activity-first compact list opens automatically. It places RUN, BLOCK, REVIEW, and READY tasks before WAIT and DONE, so current work and parallel candidates are visible at 80×24. Press `g` to switch between the list and the full DAG. Use `--view list` or `--view graph` to force either layout (`--view auto` is the default).
+
 Tasks are drawn level by level, and every task without dependencies sits on the first level, so a big plan can put dozens of boxes on one level. A level that does not fit across the pane **wraps into several rows** on one column grid, under a rule such as `-- level 1 · 23 tasks · 12 rows ---`. Boxes never overlap, whatever the width.
 
 A graph taller than the pane **scrolls**: `j`/`k` move the selection through every task and the view follows it. `↑ N more` above and `↓ N more` below the graph count the tasks that are not fully on screen. Connectors scroll with the boxes.
@@ -186,6 +190,7 @@ Inside a wrapped level, connectors are drawn only where they cannot be misread: 
 | `Tab`/`]`, `Shift-Tab`/`[` | Next / previous page (see [Pages](#pages)) |
 | `0`-`9` | Jump to page N (`0` is `All`) |
 | `r` | Reload `tasks.json` now (changes are also picked up automatically) |
+| `g` | Switch between compact list and DAG |
 | `q`, `Esc` | Quit |
 
 ## Development

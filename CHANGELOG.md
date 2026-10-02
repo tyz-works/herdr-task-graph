@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 0.5.0 - 2026-10-03
+
+- Keep agent turn completion separate from task completion. A working agent becoming idle or done now puts its task in REVIEW; a resumed working agent returns to RUN. Only an explicit `status: done` in `tasks.json` releases dependent tasks.
+- Show an activity-first compact list automatically on terminals at most 26 rows tall or narrower than 70 columns. Use `g` to switch between list and DAG, or `--view auto|list|graph` for a static preview.
+- Match Herdr's semantic theme colors: running/working yellow, blocked red, completed/idle green, review blue, and ready teal. Read the configured built-in theme and `theme.custom` color tokens, approximating RGB in the terminal's 256-color palette without changing terminal colors.
+
 ## 0.4.0 - 2026-09-29
 
 - Split tasks into pages by their `group`: an `All` page (unchanged, everything) plus one page per distinct `group` value, and a `(no group)` page when some tasks have a group and others don't. A tab bar under the header (`All(62) | minerva(31) | mechanize-b(31)`, current page bracketed) shows every page with its task count. `Tab`/`Shift-Tab`, `]`/`[`, and the digits `0`-`9` (`0` = `All`) switch pages, wrapping at the ends. `--page <group value | all>` picks the starting page, including with `--once`.

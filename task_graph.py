@@ -13,6 +13,7 @@ import curses
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -20,6 +21,10 @@ import threading
 import time
 import unicodedata
 from typing import NamedTuple
+try:
+    import tomllib
+except ImportError:  # Python < 3.11: keep the built-in default palette
+    tomllib = None
 
 
 VALID_MANUAL_STATES = {"done", "running", "blocked", "ready", "waiting", "failed"}
@@ -27,6 +32,7 @@ MIN_PROTOCOL = 19  # Herdr 0.8.0
 MAX_VERIFIED_PROTOCOL = 22  # Herdr 0.9.0 and 0.9.1
 STATE_LABEL = {
     "done": "DONE",
+    "review": "REVIEW",
     "running": "RUN",
     "blocked": "BLOCK",
     "ready": "READY",
@@ -285,8 +291,9 @@ class DashboardModel:
         self.lock = threading.RLock()
         self.config = config
         self.agents: dict[str, dict] = {}
-        self.seen_running: set[str] = set()
-        self.auto_completed: set[str] = set()
+        # A finished agent turn is not a finished task. Keep it separate from
+        # explicit task status and clear it when the agent resumes work.
+        self.awaiting_review: set[str] = set()
         self.connection = "demo"
         self.error = ""
         # Kept apart from `error` (owned by the Herdr subscriber, cleared on
@@ -307,15 +314,16 @@ class DashboardModel:
         with self.lock:
             previous = self.agents
             self.agents = {agent["pane_id"]: agent for agent in agents if agent.get("pane_id")}
+            self.awaiting_review.intersection_update(self.agents)
             for pane_id, agent in self.agents.items():
-                status = agent.get("agent_status", "unknown")
-                old_status = previous.get(pane_id, {}).get("agent_status")
-                if status == "working":
-                    self.seen_running.add(pane_id)
-                elif pane_id in self.seen_running and status in {"idle", "done"}:
-                    self.auto_completed.add(pane_id)
-                elif old_status == "working" and status in {"idle", "done"}:
-                    self.auto_completed.add(pane_id)
+                self._track_turn(pane_id, agent.get("agent_status"),
+                                 previous.get(pane_id, {}).get("agent_status"))
+
+    def _track_turn(self, pane_id: str, status: str | None, old_status: str | None) -> None:
+        if status == "working":
+            self.awaiting_review.discard(pane_id)
+        elif status == "done" or (status == "idle" and old_status == "working"):
+            self.awaiting_review.add(pane_id)
 
     def set_compatibility(self, version: str | None, protocol: int | None) -> str:
         level, message = check_compatibility(version, protocol)
@@ -334,11 +342,7 @@ class DashboardModel:
             merged.update(data)
             merged.setdefault("pane_id", pane_id)
             self.agents[pane_id] = merged
-            status = merged.get("agent_status")
-            if status == "working":
-                self.seen_running.add(pane_id)
-            elif pane_id in self.seen_running and status in {"idle", "done"}:
-                self.auto_completed.add(pane_id)
+            self._track_turn(pane_id, merged.get("agent_status"), old.get("agent_status"))
 
     def match_agent(self, task: dict) -> dict | None:
         pane_id = task.get("pane_id")
@@ -374,12 +378,12 @@ class DashboardModel:
                     elif agent:
                         pane_id = agent.get("pane_id", "")
                         agent_status = agent.get("agent_status", "unknown")
-                        if pane_id in self.auto_completed or agent_status == "done":
-                            state = "done"
-                        elif agent_status == "working":
+                        if agent_status == "working":
                             state = "running"
                         elif agent_status == "blocked":
                             state = "blocked"
+                        elif pane_id in self.awaiting_review or agent_status == "done":
+                            state = "review"
                         elif agent_status == "unknown":
                             state = "unknown" if dependencies_done else "waiting"
                         else:
@@ -413,8 +417,9 @@ def agent_name(agent: dict) -> str:
 def state_style(state: str) -> str:
     return {
         "done": "green",
-        "running": "cyan",
-        "ready": "yellow",
+        "review": "blue",
+        "running": "yellow",
+        "ready": "teal",
         "waiting": "muted",
         "blocked": "red",
         "failed": "red",
@@ -432,6 +437,16 @@ LEVEL_GAP = 4  # rows between levels; the connectors run through them
 DIVIDER_ROWS = 2  # rule that introduces a wrapped level, plus the row the arrows land on
 VIEW_TOP = 5  # first screen row of the graph; the row above holds "↑ N more"
 VIEW_RESERVED_ROWS = 9  # screen rows that are not graph: header (5), "↓ N more" and 3 footer rows
+COMPACT_PRIORITY = {"running": 0, "blocked": 1, "review": 2, "ready": 3,
+                    "unknown": 4, "waiting": 5, "failed": 6, "done": 7}
+
+
+def use_compact_view(width: int, height: int, view: str = "auto") -> bool:
+    return view == "list" or (view == "auto" and (height <= 26 or width < 70))
+
+
+def ordered_tasks(tasks: list[dict], states: dict[str, str], compact: bool) -> list[dict]:
+    return sorted(tasks, key=lambda task: COMPACT_PRIORITY[states[task["id"]]]) if compact else tasks
 
 
 def task_name(task: dict) -> str:
@@ -648,7 +663,8 @@ def draw_tabs(canvas: Canvas, pages: list[PageInfo], current: tuple, width: int)
 
 
 def render_dashboard(
-    model: DashboardModel, width: int, height: int, selected: int = 0, page: tuple = ALL_PAGE
+    model: DashboardModel, width: int, height: int, selected: int = 0, page: tuple = ALL_PAGE,
+    view: str = "auto",
 ) -> Canvas:
     canvas = Canvas(width, height)
     with model.lock:
@@ -664,7 +680,8 @@ def render_dashboard(
     page_keys = {info.key for info in pages}
     if page not in page_keys:
         page = ALL_PAGE
-    tasks = tasks_for_page(all_tasks, page)
+    compact = use_compact_view(width, height, view)
+    tasks = ordered_tasks(tasks_for_page(all_tasks, page), states, compact)
     page_ids = {task["id"] for task in tasks}
     names = {task["id"]: task_name(task) for task in all_tasks}
     selected = max(0, min(selected, len(tasks) - 1)) if tasks else 0
@@ -675,6 +692,57 @@ def render_dashboard(
     canvas.put(max(24, width - cell_width(title) - 2), 0, title, "header")
     canvas.hline(0, width - 1, 1, "=")
     draw_tabs(canvas, pages, page, width)
+
+    if compact:
+        canvas.put(2, 3, "ACTIVE TASKS  /  COMPACT", "header")
+        canvas.put(28, 3, clip(f"[{connection}] {compatibility_message}", width - 29),
+                   "red" if compatibility == "incompatible" else "muted")
+        canvas.put(2, 4, "running → blocked → review → ready → waiting → done", "muted")
+        available = max(0, height - 9)
+        with model.lock:
+            top = min(model.view_top, max(0, len(tasks) - available))
+            if selected < top:
+                top = selected
+            elif available and selected >= top + available:
+                top = selected - available + 1
+            model.view_top = top
+        ready_count = sum(states[task["id"]] == "ready" for task in tasks)
+        for row, task in enumerate(tasks[top:top + available], start=5):
+            task_id = task["id"]
+            state = states[task_id]
+            style = state_style(state)
+            marker = ">" if task_id == selected_id else " "
+            canvas.put(1, row, marker)
+            canvas.put(3, row, "●", style)
+            canvas.put(5, row, fit(STATE_LABEL[state], 7), style)
+            title = f"{task_name(task)}  {task['title']}"
+            meta = ""
+            agent = matches.get(task_id)
+            if agent:
+                meta = agent_name(agent)
+            elif state == "waiting":
+                meta = "needs " + ", ".join(names.get(dep, dep) for dep in task.get("depends_on", [])
+                                               if states.get(dep) != "done")
+            elif state == "ready" and ready_count > 1:
+                meta = f"parallel ×{ready_count}"
+            title_width = max(1, width - 15 - cell_width(meta)) if meta else max(1, width - 14)
+            canvas.put(13, row, clip(title, title_width))
+            if meta:
+                canvas.put(max(13, width - cell_width(meta) - 2), row, clip(meta, width - 15), "muted")
+        if top:
+            canvas.put(2, height - 4, f"↑ {top} more", "teal")
+        if len(tasks) > top + available:
+            canvas.put(max(2, width - 16), height - 4,
+                       f"↓ {len(tasks) - top - available} more", "teal")
+        counts = {state: list(states.values()).count(state) for state in STATE_LABEL}
+        summary = (f"{counts['running']} running · {counts['blocked']} blocked · "
+                   f"{counts['review']} review · {counts['ready']} ready · {counts['done']} done")
+        if error:
+            canvas.put(1, height - 2, clip("ERROR: " + error, width - 2), "red")
+        else:
+            canvas.put(1, height - 2, clip(summary, width - 2))
+        canvas.put(1, height - 1, "j/k: select  Enter: focus  g: DAG/list  Tab: page  r: reload  q: quit", "muted")
+        return canvas
 
     # Herdr already has its own outer sidebar. Repeat the agent list only when
     # the plugin pane is wide enough to keep three parallel DAG nodes apart.
@@ -688,8 +756,10 @@ def render_dashboard(
         for agent in agents[:max_agents]:
             status = str(agent.get("agent_status", "unknown"))
             label = clip(agent_name(agent), side_width - 4)
-            canvas.put(2, y, label, state_style(status if status != "working" else "running"))
-            canvas.put(4, y + 1, status, state_style(status if status != "working" else "running"))
+            agent_style = {"working": "yellow", "blocked": "red", "done": "green",
+                           "idle": "green"}.get(status, "muted")
+            canvas.put(2, y, "● " + label, agent_style)
+            canvas.put(4, y + 1, status, agent_style)
             y += 2
         if not agents:
             canvas.put(2, 5, "no agents", "muted")
@@ -808,7 +878,8 @@ def render_dashboard(
     counts = {state: list(states.values()).count(state) for state in STATE_LABEL}
     summary = (
         f"{counts['running']} running  ·  {counts['ready']} ready  ·  "
-        f"{counts['waiting']} waiting  ·  {counts['done']} done  ·  {counts['blocked']} blocked"
+        f"{counts['waiting']} waiting  ·  {counts['review']} review  ·  "
+        f"{counts['done']} done  ·  {counts['blocked']} blocked"
     )
     if compatibility == "warning" and not error:
         canvas.put(1, height - 3, clip("WARNING: " + compatibility_message, width - 2), "yellow")
@@ -817,7 +888,7 @@ def render_dashboard(
         canvas.put(1, height - 2, clip(summary, width - 2), "red")
     else:
         canvas.put(1, height - 2, clip(summary, width - 2), "normal")
-    canvas.put(1, height - 1, "j/k or arrows: select   Enter: focus pane   r: reload   q: quit", "muted")
+    canvas.put(1, height - 1, "j/k: select  Enter: focus  g: DAG/list  Tab: page  r: reload  q: quit", "muted")
     return canvas
 
 
@@ -984,22 +1055,96 @@ def focus_pane(pane_id: str) -> None:
     )
 
 
+HERDR_PALETTES = {
+    # Herdr Palette::{theme} semantic green / yellow / red / blue / teal.
+    "catppuccin": ("#a6e3a1", "#f9e2af", "#f38ba8", "#89b4fa", "#94e2d5"),
+    "catppuccin-latte": ("#40a02b", "#df8e1d", "#d20f39", "#1e66f5", "#179299"),
+    "tokyo-night": ("#9ece6a", "#e0af68", "#f7768e", "#7aa2f7", "#7dcfff"),
+    "tokyo-night-day": ("#587539", "#8c6c3e", "#f52a65", "#2e7de9", "#118c74"),
+    "dracula": ("#50fa7b", "#f1fa8c", "#ff5555", "#8be9fd", "#8be9fd"),
+    "nord": ("#a3be8c", "#ebcb8b", "#bf616a", "#81a1c1", "#8fbcbb"),
+    "gruvbox": ("#b8bb26", "#fabd2f", "#fb4934", "#83a598", "#8ec07c"),
+    "gruvbox-light": ("#79740e", "#b57614", "#9d0006", "#076678", "#427b58"),
+    "one-dark": ("#98c379", "#e5c07b", "#e06c75", "#61afef", "#56b6c2"),
+    "one-light": ("#50a14f", "#c18401", "#e45649", "#4078f2", "#0184bc"),
+    "solarized": ("#859900", "#b58900", "#dc322f", "#268bd2", "#2aa198"),
+    "solarized-light": ("#859900", "#b58900", "#dc322f", "#268bd2", "#2aa198"),
+    "kanagawa": ("#76946a", "#c0a36e", "#c34043", "#7e9cd8", "#7fb4ca"),
+    "kanagawa-lotus": ("#6f894e", "#77713f", "#c84053", "#4d699b", "#4e8ca2"),
+    "rose-pine": ("#31748f", "#f6c177", "#eb6f92", "#31748f", "#9ccfd8"),
+    "rose-pine-dawn": ("#286983", "#ea9d34", "#b4637a", "#286983", "#56949f"),
+    "vesper": ("#99ffe4", "#ffc799", "#ff8080", "#b0b0b0", "#66ddcc"),
+}
+
+
+def herdr_theme_colors(config_path: Path | None = None) -> dict[str, str] | None:
+    """Read Herdr's configured semantic colors; None means terminal ANSI colors."""
+    config_path = config_path or Path.home() / ".config" / "herdr" / "config.toml"
+    try:
+        config = tomllib.loads(config_path.read_text()) if tomllib else {}
+    except (OSError, ValueError):
+        config = {}
+    theme = config.get("theme", {})
+    name = os.environ.get("HERDR_TASK_GRAPH_THEME") or theme.get("name", "catppuccin")
+    if name == "terminal":
+        return None
+    names = ("green", "yellow", "red", "blue", "teal")
+    colors = dict(zip(names, HERDR_PALETTES.get(name, HERDR_PALETTES["catppuccin"])))
+    custom = theme.get("custom", {})
+    for token in names:
+        if isinstance(custom.get(token), str):
+            colors[token] = custom[token]
+    return colors
+
+
+def xterm_index(value: str, fallback: int) -> int:
+    """Closest xterm-256 color to a Herdr RGB token (never mutate terminal palette)."""
+    named = {"red": "#ff0000", "green": "#00ff00", "yellow": "#ffff00",
+             "blue": "#0000ff", "cyan": "#00ffff", "teal": "#00ffff",
+             "magenta": "#ff00ff", "white": "#ffffff", "black": "#000000"}
+    value = named.get(value.lower(), value)
+    rgb_match = re.fullmatch(r"rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)", value)
+    if rgb_match:
+        channels = tuple(int(channel) for channel in rgb_match.groups())
+        if all(channel <= 255 for channel in channels):
+            value = "#" + "".join(f"{channel:02x}" for channel in channels)
+    if len(value) == 4 and value.startswith("#"):
+        value = "#" + "".join(channel * 2 for channel in value[1:])
+    if not (len(value) == 7 and value.startswith("#")):
+        return fallback
+    try:
+        rgb = tuple(int(value[index:index + 2], 16) for index in (1, 3, 5))
+    except ValueError:
+        return fallback
+    ramp = (0, 95, 135, 175, 215, 255)
+    candidates = [(16 + 36*r + 6*g + b, (ramp[r], ramp[g], ramp[b]))
+                  for r in range(6) for g in range(6) for b in range(6)]
+    candidates += [(232 + i, (8 + 10*i,) * 3) for i in range(24)]
+    return min(candidates, key=lambda item: sum((a - b) ** 2 for a, b in zip(rgb, item[1])))[0]
+
+
 def init_colors() -> dict[str, int]:
     attrs = {"normal": curses.A_NORMAL, "muted": curses.A_DIM, "line": curses.A_DIM}
     if not curses.has_colors():
-        attrs.update({name: curses.A_NORMAL for name in ("green", "cyan", "yellow", "red", "magenta")})
+        attrs.update({name: curses.A_NORMAL for name in ("green", "yellow", "red", "blue", "teal", "magenta")})
         attrs["header"] = curses.A_BOLD
         return attrs
     curses.start_color()
     curses.use_default_colors()
     pairs = {
         "green": curses.COLOR_GREEN,
-        "cyan": curses.COLOR_CYAN,
         "yellow": curses.COLOR_YELLOW,
         "red": curses.COLOR_RED,
+        "blue": curses.COLOR_BLUE,
+        "teal": curses.COLOR_CYAN,
         "magenta": curses.COLOR_MAGENTA,
         "header": curses.COLOR_BLUE,
     }
+    palette = herdr_theme_colors() if curses.COLORS >= 256 else None
+    if palette:
+        for name in ("green", "yellow", "red", "blue", "teal"):
+            pairs[name] = xterm_index(palette[name], pairs[name])
+        pairs["header"] = pairs["blue"]
     for index, (name, color) in enumerate(pairs.items(), start=1):
         curses.init_pair(index, color, -1)
         attrs[name] = curses.color_pair(index) | (curses.A_BOLD if name == "header" else curses.A_NORMAL)
@@ -1027,12 +1172,14 @@ def paint(stdscr, canvas: Canvas, attrs: dict[str, int]) -> None:
     stdscr.refresh()
 
 
-def run_tui(stdscr, model: DashboardModel, config_path: Path, initial_page: tuple = ALL_PAGE) -> None:
+def run_tui(stdscr, model: DashboardModel, config_path: Path, initial_page: tuple = ALL_PAGE,
+            initial_view: str = "auto") -> None:
     curses.curs_set(0)
     stdscr.keypad(True)
     stdscr.timeout(250)
     attrs = init_colors()
     page = initial_page
+    view = initial_view
     page_selection: dict[tuple, str] = {}
     selected = 0
     while True:
@@ -1041,15 +1188,17 @@ def run_tui(stdscr, model: DashboardModel, config_path: Path, initial_page: tupl
         pages = compute_pages(tasks, model.config.get("groups"))
         if page not in {info.key for info in pages}:
             page = ALL_PAGE
-        page_tasks = tasks_for_page(tasks, page)
+        height, width = stdscr.getmaxyx()
+        states, _ = model.task_states()
+        page_tasks = ordered_tasks(tasks_for_page(tasks, page), states,
+                                   use_compact_view(width, height, view))
         if page_tasks:
             remembered = page_selection.get(page)
             ids = [task["id"] for task in page_tasks]
             selected = ids.index(remembered) if remembered in ids else 0
         else:
             selected = 0
-        height, width = stdscr.getmaxyx()
-        paint(stdscr, render_dashboard(model, width, height, selected, page), attrs)
+        paint(stdscr, render_dashboard(model, width, height, selected, page, view), attrs)
         key = stdscr.getch()
         if key in (ord("q"), 27):
             return
@@ -1066,6 +1215,9 @@ def run_tui(stdscr, model: DashboardModel, config_path: Path, initial_page: tupl
                 focus_pane(agent["pane_id"])
         elif key == ord("r"):
             reload_config(model, config_path)
+        elif key == ord("g"):
+            view = "graph" if use_compact_view(width, height, view) else "list"
+            model.view_top = 0
         elif key in (ord("\t"), ord("]")):
             page = adjacent_page(pages, page, 1)
         elif key in (curses.KEY_BTAB, ord("[")):
@@ -1085,6 +1237,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=120, help="width used by --once")
     parser.add_argument("--height", type=int, default=36, help="height used by --once")
     parser.add_argument("--page", help="initial page: a group value, or 'all' (default)")
+    parser.add_argument("--view", choices=("auto", "graph", "list"), default="auto",
+                        help="auto uses a compact list on short or narrow terminals")
     return parser.parse_args(argv)
 
 
@@ -1117,13 +1271,14 @@ def main(argv: list[str] | None = None) -> int:
 
     exit_code = 0
     if args.once:
-        print("\n".join(render_dashboard(model, args.width, args.height, page=initial_page).plain_lines()))
+        print("\n".join(render_dashboard(model, args.width, args.height, page=initial_page,
+                                         view=args.view).plain_lines()))
         exit_code = 1 if model.config_error else 0
     elif not sys.stdin.isatty() or not sys.stdout.isatty():
         print("Interactive mode requires a TTY. Use --once for a static preview.", file=sys.stderr)
         return 2
     else:
-        curses.wrapper(run_tui, model, config_path, initial_page)
+        curses.wrapper(run_tui, model, config_path, initial_page, args.view)
 
     if subscriber:
         subscriber.stop()
