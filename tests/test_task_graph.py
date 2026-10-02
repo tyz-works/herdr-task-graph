@@ -75,6 +75,56 @@ class TaskGraphTests(unittest.TestCase):
         self.assertIn("[RUN] B", output)
         self.assertIn("[READY] E", output)
 
+    def test_agent_turn_completion_requires_task_confirmation(self):
+        config = {"tasks": [{"id": "A", "title": "A", "depends_on": [], "pane_id": "p"},
+                            {"id": "B", "title": "B", "depends_on": ["A"]}]}
+        model = task_graph.DashboardModel(config)
+        model.set_agents([{"pane_id": "p", "agent_status": "working"}])
+        self.assertEqual(model.task_states()[0], {"A": "running", "B": "waiting"})
+        model.update_agent({"pane_id": "p", "agent_status": "idle"})
+        self.assertEqual(model.task_states()[0], {"A": "review", "B": "waiting"})
+        model.update_agent({"pane_id": "p", "agent_status": "working"})
+        self.assertEqual(model.task_states()[0], {"A": "running", "B": "waiting"})
+        model.update_agent({"pane_id": "p", "agent_status": "done"})
+        self.assertEqual(model.task_states()[0], {"A": "review", "B": "waiting"})
+        model.set_agents([{"pane_id": "p", "agent_status": "working"}])
+        self.assertEqual(model.task_states()[0]["A"], "running")
+        model.set_agents([{"pane_id": "p", "agent_status": "idle"}])
+        self.assertEqual(model.task_states()[0]["A"], "review")
+        config["tasks"][0]["status"] = "done"
+        self.assertEqual(model.task_states()[0], {"A": "done", "B": "ready"})
+
+    def test_compact_screen_shows_active_tasks_before_done(self):
+        model = task_graph.DashboardModel(task_graph.load_config(ROOT / "tasks.json"))
+        model.set_agents(task_graph.demo_agents())
+        canvas = task_graph.render_dashboard(model, 80, 24)
+        lines = canvas.plain_lines()
+        self.assertIn("COMPACT", lines[3])
+        self.assertIn("RUN     B", lines[5])
+        self.assertIn("RUN     C", lines[6])
+        self.assertIn("READY   E", "\n".join(lines))
+        self.assertLess("\n".join(lines).index("RUN     B"), "\n".join(lines).index("DONE    A"))
+        self.assertEqual(canvas.styles[5][3], "yellow")
+        self.assertEqual(task_graph.state_style("running"), "yellow")
+
+    def test_theme_palette_uses_herdr_semantic_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text('[theme]\nname = "nord"\n[theme.custom]\nyellow = "#123456"\n')
+            colors = task_graph.herdr_theme_colors(path)
+        self.assertEqual(colors["yellow"], "#123456")
+        self.assertEqual(colors["green"], "#a3be8c")
+        self.assertEqual(task_graph.xterm_index("rgb(18, 52, 86)", 3),
+                         task_graph.xterm_index("#123456", 3))
+
+    def test_compact_selection_scrolls_to_every_task(self):
+        config = {"tasks": [{"id": str(i), "title": f"Task {i}", "depends_on": []}
+                            for i in range(40)]}
+        model = task_graph.DashboardModel(config)
+        lines = task_graph.render_dashboard(model, 80, 24, selected=39).plain_lines()
+        self.assertIn("> ● READY   39  Task 39", "\n".join(lines))
+        self.assertIn("↑ 25 more", "\n".join(lines))
+
 
 class OneRequestHerdrServer:
     """Fake Herdr 0.9.0 socket server.
@@ -624,7 +674,8 @@ class ReadableLayoutTests(unittest.TestCase):
     def test_selection_stays_visible_on_a_short_terminal(self):
         for selected in range(len(self.ids)):
             with self.subTest(selected=selected):
-                boxes = drawn_boxes(self.frame_lines(80, selected, height=20))
+                boxes = drawn_boxes(task_graph.render_dashboard(
+                    self.model, 80, 20, selected, view="graph").plain_lines())
                 chosen = [box for box in boxes if box["selected"]]
                 self.assertEqual([box["name"] for box in chosen], [self.ids[selected]])
                 self.assertTrue(chosen[0]["intact"])
@@ -809,7 +860,7 @@ class TitleReadabilityTests(unittest.TestCase):
 
     def test_a_narrow_pane_still_draws_intact_boxes(self):
         model = task_graph.DashboardModel(crewvia_like_config(long_ids=True, labels=True, groups=True))
-        boxes = drawn_boxes(grid_lines(task_graph.render_dashboard(model, 50, 30, 0)))
+        boxes = drawn_boxes(grid_lines(task_graph.render_dashboard(model, 50, 30, 0, view="graph")))
         self.assertGreaterEqual(len(boxes), 2)
         self.assertTrue(all(box["intact"] for box in boxes), boxes)
 
